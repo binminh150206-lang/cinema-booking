@@ -278,7 +278,7 @@ END;
         pkg_booking.sp_hold_seats(:p_customer_id, :p_showtime_id, v_list, v_bk);
         SELECT expires_at INTO v_exp FROM booking WHERE booking_id = v_bk;
         :booking_id := v_bk;
-        :expires_at := TO_CHAR(v_exp, 'YYYY-MM-DD"T"HH24:MI:SS');
+        :expires_at := TO_CHAR(FROM_TZ(v_exp, TO_CHAR(SYSTIMESTAMP, 'TZH:TZM')), 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM');
       EXCEPTION
         WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
       END;
@@ -294,7 +294,7 @@ END;
     p_source_type => 'plsql/block',
     p_source      => q'[
       BEGIN
-        pkg_booking.sp_confirm_booking(:p_booking_id, :p_promo_code, :p_method, :p_combos);
+        pkg_booking.sp_confirm_booking(:p_booking_id, :p_promo_code, :p_method);
         SELECT booking_id, subtotal, discount_amount, final_amount
           INTO :booking_id, :subtotal, :discount_amount, :final_amount
           FROM booking WHERE booking_id = :p_booking_id;
@@ -341,7 +341,7 @@ END;
              ) AS seats,
              NVL(b.final_amount, 0) AS final_amount,
              b.showtime_id, b.subtotal, b.discount_amount,
-             TO_CHAR(b.expires_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS exp
+             TO_CHAR(FROM_TZ(b.expires_at, TO_CHAR(SYSTIMESTAMP, 'TZH:TZM')), 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM') AS exp
         FROM booking b
         JOIN showtime st ON st.showtime_id = b.showtime_id
         JOIN movie m ON m.movie_id = st.movie_id
@@ -357,7 +357,7 @@ END;
     p_source_type => 'json/item',
     p_source      => q'~
       SELECT b.booking_id,
-             TO_CHAR(b.expires_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS expires_at,
+             TO_CHAR(FROM_TZ(b.expires_at, TO_CHAR(SYSTIMESTAMP, 'TZH:TZM')), 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM') AS expires_at,
              b.showtime_id,
              '[' || (SELECT LISTAGG(ss.seat_id, ',') WITHIN GROUP (ORDER BY ss.seat_id)
                        FROM showtime_seat ss WHERE ss.booking_id = b.booking_id) || ']' AS "seat_ids{}"
@@ -366,26 +366,7 @@ END;
     ~'
   );
 
-  -- 4. COMBO & KHUYẾN MÃI
-  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'combos');
-  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'combos', p_method => 'GET', p_source_type => 'json/collection', p_source => 'SELECT combo_id, name, description AS "desc", price FROM combo WHERE is_active = 1 ORDER BY combo_id');
-  ORDS.DEFINE_HANDLER(
-    p_module_name => 'cinema_api', p_pattern => 'combos', p_method => 'POST',
-    p_source_type => 'plsql/block',
-    p_source      => q'[
-      BEGIN
-        INSERT INTO combo(name, description, price) VALUES (:name, :desc, :price);
-        COMMIT;
-      EXCEPTION
-        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
-      END;
-    ]'
-  );
-  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'combos', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
-
-  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'combos/:id');
-  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'combos/:id', p_method => 'DELETE', p_source_type => 'plsql/block', p_source => 'BEGIN UPDATE combo SET is_active = 0 WHERE combo_id = :id; COMMIT; END;');
-
+  -- 4. KHUYẾN MÃI
   ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'promos');
   ORDS.DEFINE_HANDLER(
     p_module_name => 'cinema_api', p_pattern => 'promos', p_method => 'GET',
@@ -403,24 +384,35 @@ END;
     p_source_type => 'plsql/block',
     p_source      => q'[
       DECLARE
-        v_obj JSON_OBJECT_T := JSON_OBJECT_T.parse(:body_text);
-        v_code VARCHAR2(30) := UPPER(TRIM(v_obj.get_String('code')));
-        v_cnt NUMBER; v_days JSON_ARRAY_T; v_cond VARCHAR2(500) := NULL;
+        v_code VARCHAR2(30) := UPPER(TRIM(:code));
+        v_cnt  NUMBER;
+        v_cond VARCHAR2(500) := NULL;
       BEGIN
         SELECT COUNT(*) INTO v_cnt FROM promotion WHERE code = v_code;
-        IF v_cnt > 0 THEN RAISE_APPLICATION_ERROR(-20070, 'Mã khuyến mãi đã tồn tại'); END IF;
-        IF v_obj.has('days') AND NOT v_obj.get('days').is_null THEN
-          v_days := v_obj.get_Array('days');
-          IF v_days.get_size > 0 THEN v_cond := '{"days":' || v_days.to_string() || '}'; END IF;
+        IF v_cnt > 0 THEN
+          RAISE_APPLICATION_ERROR(-20070, 'Mã khuyến mãi đã tồn tại');
         END IF;
-        INSERT INTO promotion(code, discount_type, discount_value, max_discount, min_amount, valid_from, valid_to, max_uses, used_count, is_active, conditions)
+
+        IF :days IS NOT NULL AND LENGTH(TRIM(:days)) > 2 THEN
+          v_cond := '{"days":' || TRIM(:days) || '}';
+        END IF;
+
+        INSERT INTO promotion(
+          code, discount_type, discount_value, max_discount, min_amount,
+          valid_from, valid_to, max_uses, used_count, is_active, conditions
+        )
         VALUES (
-          v_code, v_obj.get_String('type'), TO_NUMBER(v_obj.get_String('value')),
-          CASE WHEN v_obj.has('max') AND NOT v_obj.get('max').is_null THEN TO_NUMBER(v_obj.get_String('max')) ELSE NULL END,
-          CASE WHEN v_obj.has('min') AND NOT v_obj.get('min').is_null THEN TO_NUMBER(v_obj.get_String('min')) ELSE 0 END,
-          DATE '2026-01-01', DATE '2026-12-31',
-          CASE WHEN v_obj.has('maxUses') AND NOT v_obj.get('maxUses').is_null THEN TO_NUMBER(v_obj.get_String('maxUses')) ELSE NULL END,
-          0, 1, CASE WHEN v_cond IS NOT NULL THEN JSON(v_cond) ELSE NULL END
+          v_code,
+          :type,
+          TO_NUMBER(:value),
+          CASE WHEN :max IS NOT NULL AND TRIM(:max) IS NOT NULL THEN TO_NUMBER(:max) ELSE NULL END,
+          CASE WHEN :min IS NOT NULL AND TRIM(:min) IS NOT NULL THEN TO_NUMBER(:min) ELSE 0 END,
+          DATE '2026-01-01',
+          DATE '2026-12-31',
+          CASE WHEN :max_uses IS NOT NULL AND TRIM(:max_uses) IS NOT NULL THEN TO_NUMBER(:max_uses) ELSE NULL END,
+          0,
+          1,
+          CASE WHEN v_cond IS NOT NULL THEN JSON(v_cond) ELSE NULL END
         );
         COMMIT;
       EXCEPTION

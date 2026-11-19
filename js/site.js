@@ -61,19 +61,7 @@ const NEWS = [
     body: "Nhập mã THU3 khi thanh toán để giảm 15% (tối đa 40.000đ) cho các suất chiếu vào thứ Ba. Mã không áp dụng cho các ngày khác trong tuần.",
   },
   {
-    id: 3,
-    date: "01/11/2026",
-    title: "Suất sớm giảm 20% mỗi ngày",
-    body: "Các suất chiếu bắt đầu trước 12 giờ trưa được giảm 20% giá vé tự động, không cần nhập mã. Cuối tuần giá vé được phụ thu 15%.",
-  },
-  {
     id: 4,
-    date: "28/10/2026",
-    title: "Combo bắp nước đặt cùng vé",
-    body: "Sau khi giữ ghế, bạn có thể chọn thêm combo bắp nước ngay trong bước thanh toán. Combo được cộng vào tổng tiền của đơn và không bị tính vào mức giảm của mã khuyến mãi.",
-  },
-  {
-    id: 5,
     date: "25/10/2026",
     title: "Quy định huỷ vé và hoàn tiền",
     body: "Đơn chưa thanh toán có thể huỷ bất kỳ lúc nào. Vé đã thanh toán chỉ huỷ được khi còn ít nhất 2 giờ trước giờ chiếu và được hoàn 100% số tiền đã trả.",
@@ -298,11 +286,7 @@ async function pDatVe() {
     );
     return;
   }
-  const [st, ms, combos] = await Promise.all([
-      API.showtime(id),
-      API.movies(),
-      API.combos(),
-    ]),
+  const [st, ms] = await Promise.all([API.showtime(id), API.movies()]),
     mv = ms.find((x) => x.movie_id == st.movie_id) || {
       movie_id: 0,
       title: st.title,
@@ -320,9 +304,6 @@ async function pDatVe() {
       showErr(e);
     }
   }
-  const cmb = {},
-    comboTot = () =>
-      combos.reduce((a, c) => a + c.price * (cmb[c.combo_id] || 0), 0);
   const info = (i) => seats.find((x) => x.seat_id === i),
     label = (i) => info(i).row_label + info(i).seat_no;
   const reload = async () => {
@@ -364,10 +345,10 @@ async function pDatVe() {
       .join("")}
     <div class="legend"><span><i style="background:var(--s1)"></i>Thường</span><span><i style="background:var(--s2)"></i>VIP</span><span><i style="background:var(--s3)"></i>Ghế đôi</span><span><i style="background:var(--red)"></i>Đang chọn</span><span><i style="background:var(--s4)"></i>Đã có người</span></div></div>
     <aside class="box"><div class="sum">${poster(mv)}<div><h3>${mv.title}</h3><div class="muted">${fDate(st.start_time)} ${fTime(st.start_time)}<br>${st.theater_name || ""}, ${st.room_name || ""}</div></div></div>
-    <p>Ghế: <b>${[...sel].map(label).join(", ") || "chưa chọn"}</b></p><div class="tot"><span>Tạm tính</span><span id="tot">${est ? money(est + comboTot()) : "—"}</span></div><br>
+    <p>Ghế: <b>${[...sel].map(label).join(", ") || "chưa chọn"}</b></p><div class="tot"><span>Tạm tính</span><span id="tot">${est ? money(est) : "—"}</span></div><br>
     ${
       hold
-        ? `<p>Đơn #${hold.id}, còn <b id="cd"></b> để thanh toán</p><h4 style="margin:.4rem 0">Bắp nước</h4>${combos.map((c) => `<label style="display:flex;justify-content:space-between;gap:.5rem;margin:.3rem 0"><span>${c.name}<br><small class="muted">${c.desc}, ${money(c.price)}</small></span><input type="number" min="0" max="10" value="${cmb[c.combo_id] || 0}" data-cb="${c.combo_id}" style="width:64px;min-width:0"></label>`).join("")}<div class="pay"><input id="promo" placeholder="Mã khuyến mãi" style="min-width:0;width:100%;margin-bottom:.5rem"><label><input type="radio" name="m" value="MOMO" checked>Ví MoMo</label><label><input type="radio" name="m" value="ZALOPAY">ZaloPay</label><label><input type="radio" name="m" value="CARD">Thẻ ATM / Visa</label></div><br><button class="btn" id="pay">Thanh toán</button> <button class="btn alt" id="cancel">Huỷ đơn</button>`
+        ? `<p>Đơn #${hold.id}, còn <b id="cd"></b> để thanh toán</p><div class="pay"><input id="promo" placeholder="Mã khuyến mãi" style="min-width:0;width:100%;margin-bottom:.5rem"><label><input type="radio" name="m" value="MOMO" checked>Ví MoMo</label><label><input type="radio" name="m" value="ZALOPAY">ZaloPay</label><label><input type="radio" name="m" value="CARD">Thẻ ATM / Visa</label></div><br><button class="btn" id="pay">Thanh toán</button> <button class="btn alt" id="cancel">Huỷ đơn</button>`
         : `<button class="btn" id="hold" ${sel.size ? "" : "disabled"}>Giữ ghế 10 phút</button><p class="muted small">Chọn tối đa 8 ghế mỗi đơn.</p>`
     }</aside></div></div>`;
     app.querySelectorAll(".seat").forEach(
@@ -378,13 +359,6 @@ async function pDatVe() {
           else if (sel.size < 8) sel.add(i);
           else toast("Tối đa 8 ghế mỗi đơn", true);
           draw();
-        }),
-    );
-    app.querySelectorAll("[data-cb]").forEach(
-      (i) =>
-        (i.oninput = () => {
-          cmb[i.dataset.cb] = Math.max(0, Math.min(10, +i.value || 0));
-          $("#tot").textContent = money(est + comboTot());
         }),
     );
     on("#hold", async () => {
@@ -411,7 +385,6 @@ async function pDatVe() {
           hold.id,
           $("#promo").value.trim() || null,
           document.querySelector("[name=m]:checked").value,
-          cmb,
         );
         clearInterval(timer);
         sessionStorage.setItem(
@@ -453,7 +426,7 @@ async function pVe() {
       '<div class="wrap"><h1 class="t">Vé của bạn</h1><p style="text-align:center" class="muted">Bạn chưa có vé nào. <a href="phim.html" style="color:var(--red)">Chọn phim ngay</a></p></div>';
     return;
   }
-  app.innerHTML = `<div class="wrap"><div class="steps"><span>1. Chọn ghế</span><span>2. Thanh toán</span><span class="on">3. Nhận vé</span></div><div class="stub"><div class="main"><h2 style="margin:0;color:var(--red)">${t.title || "Vé xem phim"}</h2><p class="muted">${t.when || ""}, ${t.room || ""}</p><p>Ghế: <b>${(t.tickets || []).map((x) => x.seat_label).join(", ") || t.seatsText || "—"}</b></p><p>${(t.combos || []).map((c) => c.qty + " x " + c.name).join(", ")}</p><p class="muted">Tiền vé ${money(t.subtotal)}, giảm ${money(t.discount_amount)}</p><h3 style="margin:0">Đã thanh toán ${money(t.final_amount)}</h3><div class="bar"></div></div><div class="tear"><p class="muted">Mã đơn</p><h2 style="margin:0">#${t.booking_id}</h2><div id="qr" style="display:inline-block;background:#fff;padding:6px;border-radius:8px;margin:.6rem 0"></div><p class="muted">Trạng thái</p><b id="st">PAID</b></div></div>
+  app.innerHTML = `<div class="wrap"><div class="steps"><span>1. Chọn ghế</span><span>2. Thanh toán</span><span class="on">3. Nhận vé</span></div><div class="stub"><div class="main"><h2 style="margin:0;color:var(--red)">${t.title || "Vé xem phim"}</h2><p class="muted">${t.when || ""}, ${t.room || ""}</p><p>Ghế: <b>${(t.tickets || []).map((x) => x.seat_label).join(", ") || t.seatsText || "—"}</b></p><p class="muted">Tiền vé ${money(t.subtotal)}, giảm ${money(t.discount_amount)}</p><h3 style="margin:0">Đã thanh toán ${money(t.final_amount)}</h3><div class="bar"></div></div><div class="tear"><p class="muted">Mã đơn</p><h2 style="margin:0">#${t.booking_id}</h2><div id="qr" style="display:inline-block;background:#fff;padding:6px;border-radius:8px;margin:.6rem 0"></div><p class="muted">Trạng thái</p><b id="st">PAID</b></div></div>
   <p style="text-align:center"><button class="btn alt" onclick="print()">In vé</button> <button class="btn alt" id="refund">Huỷ vé và hoàn tiền</button> <a class="btn" href="index.html">Về trang chủ</a></p></div>`;
   if (window.QRCode)
     new QRCode($("#qr"), {
@@ -584,7 +557,7 @@ function pUuDai() {
       "Giảm 15% (tối đa 40.000đ), chỉ áp dụng cho suất chiếu thứ Ba. Điều kiện này lưu trong cột JSON PROMOTION.conditions.",
     ],
   ];
-  app.innerHTML = `<div class="wrap"><h1 class="t">Tin mới và ưu đãi</h1><div class="grid">${l.map((x) => `<div class="box promo"><h3>${x[1]}</h3><p>${x[2]}</p><p>Mã: <code>${x[0]}</code></p></div>`).join("")}<div class="box promo"><h3>Suất sớm giảm 20%</h3><p>Suất chiếu trước 12 giờ trưa tự động giảm giá, không cần nhập mã. Cuối tuần phụ thu 15%.</p></div></div></div>`;
+  app.innerHTML = `<div class="wrap"><h1 class="t">Tin mới và ưu đãi</h1><div class="grid">${l.map((x) => `<div class="box promo"><h3>${x[1]}</h3><p>${x[2]}</p><p>Mã: <code>${x[0]}</code></p></div>`).join("")}</div></div>`;
 }
 
 function pDangNhap() {
@@ -652,7 +625,6 @@ async function pVeCuaToi() {
             room: x.room_name,
             tickets: x.tickets,
             seatsText: x.seats,
-            combos: x.combos,
             subtotal: x.subtotal,
             discount_amount: x.discount_amount,
             final_amount: x.final_amount,
@@ -746,7 +718,6 @@ async function pQuanTri() {
       ["phim", "Phim"],
       ["suat", "Suất chiếu"],
       ["khuyenmai", "Khuyến mãi"],
-      ["combo", "Combo"],
       ["khach", "Khách hàng"],
     ];
   app.innerHTML = `<div class="wrap"><h1 class="t">Quản trị</h1><div class="tabs" style="flex-wrap:wrap">${tabs.map(([k, v]) => `<button class="${k === tab ? "on" : ""}" onclick="location.href='quan-tri.html?tab=${k}'">${v}</button>`).join("")}</div><div id="ad"></div></div>`;
@@ -756,7 +727,6 @@ async function pQuanTri() {
       phim: aMovies,
       suat: aShow,
       khuyenmai: aPromo,
-      combo: aCombo,
       khach: aCust,
     }[tab] || aRev
   )($("#ad"));
@@ -1010,7 +980,7 @@ async function aShow(box) {
 async function aPromo(box) {
   const ps = await API.promos(),
     again = () => aPromo(box);
-  box.innerHTML = `<h3>Thêm mã khuyến mãi</h3><form id="f" ${FORM}>${fld("code", "Mã", "required")}<label>Loại<br><select name="type"><option value="PERCENT">Giảm theo %</option><option value="FIXED">Giảm số tiền</option></select></label>${fld("value", "Giá trị", 'type="number" min="1" required')}${fld("max", "Giảm tối đa (đ)", 'type="number" min="0"')}${fld("min", "Đơn tối thiểu (đ)", 'type="number" min="0" value="0"')}${fld("uses", "Số lượt tối đa", 'type="number" min="1"')}${fld("days", "Ngày áp dụng (MON,TUE,... để trống nếu mọi ngày)")}<button class="btn">Thêm mã</button></form>
+  box.innerHTML = `<h3>Thêm mã khuyến mãi</h3><form id="f" ${FORM}>${fld("code", "Mã", "required")}<label>Loại<br><select name="type"><option value="PERCENT">Giảm theo %</option><option value="AMOUNT">Giảm số tiền</option></select></label>${fld("value", "Giá trị", 'type="number" min="1" required')}${fld("max", "Giảm tối đa (đ)", 'type="number" min="0"')}${fld("min", "Đơn tối thiểu (đ)", 'type="number" min="0" value="0"')}${fld("uses", "Số lượt tối đa", 'type="number" min="1"')}${fld("days", "Ngày áp dụng (MON,TUE,... để trống nếu mọi ngày)")}<button class="btn">Thêm mã</button></form>
   <h3>Danh sách mã</h3><table><tr><th>Mã</th><th>Loại</th><th>Giá trị</th><th>Tối đa</th><th>Tối thiểu</th><th>Ngày</th><th>Đã dùng</th><th>Trạng thái</th></tr>${ps.map((p) => `<tr><td><b>${p.code}</b></td><td>${p.type === "PERCENT" ? "%" : "Số tiền"}</td><td>${p.type === "PERCENT" ? p.value + "%" : money(p.value)}</td><td>${p.max ? money(p.max) : "—"}</td><td>${money(p.min)}</td><td>${p.days ? p.days.join(", ") : "Mọi ngày"}</td><td>${p.used}/${p.maxUses ?? "∞"}</td><td><button class="btn alt" data-t="${p.code}">${p.active === false ? "Đang tắt, bật lại" : "Đang bật, tắt đi"}</button></td></tr>`).join("")}</table>`;
   $("#f").onsubmit = (ev) => {
     ev.preventDefault();
@@ -1041,34 +1011,6 @@ async function aPromo(box) {
       (b) =>
         (b.onclick = () =>
           act(() => API.togglePromo(b.dataset.t), "Đã cập nhật mã", again)),
-    );
-}
-
-async function aCombo(box) {
-  const cs = await API.combos(),
-    again = () => aCombo(box);
-  box.innerHTML = `<h3>Thêm combo</h3><form id="f" ${FORM}>${fld("name", "Tên combo", "required")}${fld("desc", "Mô tả", "required")}${fld("price", "Giá (đ)", 'type="number" min="0" step="1000" required')}<button class="btn">Thêm combo</button></form>
-  <h3>Danh sách combo</h3><table><tr><th>Tên</th><th>Mô tả</th><th>Giá</th><th></th></tr>${cs.map((c) => `<tr><td>${c.name}</td><td>${c.desc}</td><td>${money(c.price)}</td><td><button class="btn alt" data-d="${c.combo_id}">Xoá</button></td></tr>`).join("")}</table>`;
-  $("#f").onsubmit = (ev) => {
-    ev.preventDefault();
-    const f = new FormData(ev.target);
-    act(
-      () =>
-        API.saveCombo({
-          name: f.get("name"),
-          desc: f.get("desc"),
-          price: f.get("price"),
-        }),
-      "Đã thêm combo",
-      again,
-    );
-  };
-  box
-    .querySelectorAll("[data-d]")
-    .forEach(
-      (b) =>
-        (b.onclick = () =>
-          act(() => API.deleteCombo(b.dataset.d), "Đã xoá combo", again)),
     );
 }
 

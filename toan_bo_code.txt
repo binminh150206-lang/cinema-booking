@@ -1,0 +1,4322 @@
+﻿
+===== C:\Users\Khai\cinema-booking\database\mo-rong.sql =====
+-- Má»Ÿ rá»™ng thiáº¿t káº¿ CSDL cho cÃ¡c chá»©c nÄƒng bá»• sung cá»§a website (cháº¡y sau script gá»‘c cá»§a bÃ¡o cÃ¡o)
+ALTER TABLE theater ADD (city VARCHAR2(60));                      -- nhiá»u ráº¡p theo thÃ nh phá»‘
+ALTER TABLE customer ADD (role VARCHAR2(10) DEFAULT 'CUSTOMER' NOT NULL
+  CHECK (role IN ('CUSTOMER','ADMIN')));                          -- phÃ¢n quyá»n quáº£n trá»‹
+ALTER TABLE movie ADD (status VARCHAR2(5) DEFAULT 'NOW' NOT NULL
+  CHECK (status IN ('NOW','SOON')));                              -- phim Ä‘ang chiáº¿u / sáº¯p chiáº¿u
+
+CREATE TABLE combo (                                              -- combo báº¯p nÆ°á»›c
+  combo_id    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name        VARCHAR2(100) NOT NULL,
+  description VARCHAR2(300),
+  price       NUMBER(10) NOT NULL CHECK (price >= 0),
+  is_active   NUMBER(1) DEFAULT 1 NOT NULL
+);
+CREATE TABLE booking_combo (                                      -- combo trong tá»«ng Ä‘Æ¡n, giÃ¡ lÆ°u táº¡i thá»i Ä‘iá»ƒm bÃ¡n
+  booking_id NUMBER NOT NULL REFERENCES booking(booking_id),
+  combo_id   NUMBER NOT NULL REFERENCES combo(combo_id),
+  qty        NUMBER(2) NOT NULL CHECK (qty BETWEEN 1 AND 10),
+  unit_price NUMBER(10) NOT NULL,
+  CONSTRAINT pk_booking_combo PRIMARY KEY (booking_id, combo_id)
+);
+ALTER TABLE booking ADD (combo_amount NUMBER(10) DEFAULT 0 NOT NULL);
+-- LÆ°u Ã½: sp_confirm_booking cáº§n nháº­n danh sÃ¡ch combo, ghi booking_combo vÃ 
+-- final_amount = subtotal - discount_amount + combo_amount (khuyáº¿n mÃ£i chá»‰ tÃ­nh trÃªn tiá»n vÃ©).
+
+CREATE TABLE review (                                             -- Ä‘Ã¡nh giÃ¡ phim (má»—i khÃ¡ch má»™t Ä‘Ã¡nh giÃ¡ cho má»—i phim)
+  review_id   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  movie_id    NUMBER NOT NULL REFERENCES movie(movie_id),
+  customer_id NUMBER NOT NULL REFERENCES customer(customer_id),
+  rating      NUMBER(1) NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  content     VARCHAR2(1000),
+  created_at  TIMESTAMP DEFAULT SYSTIMESTAMP,
+  CONSTRAINT uq_review UNIQUE (movie_id, customer_id)
+);
+
+-- Há»“ sÆ¡ cÃ¡ nhÃ¢n (bá» qua cÃ¡c cá»™t Ä‘Ã£ cÃ³ sáºµn trong báº£ng customer)
+ALTER TABLE customer ADD (phone VARCHAR2(15), birth_date DATE, gender VARCHAR2(10), address VARCHAR2(200));
+
+
+===== C:\Users\Khai\cinema-booking\js\api.js =====
+// ===== Cáº¥u hÃ¬nh: 'ords' gá»i Oracle REST Data Services tháº­t, 'mock' cháº¡y giáº£ láº­p trong trÃ¬nh duyá»‡t =====
+const CONFIG = { MODE: "ords", BASE: "http://localhost:8080/ords/cinema" };
+const HOLD_MS = 10 * 60 * 1000;
+const raise = (code, msg) => {
+  const e = new Error(msg);
+  e.code = code;
+  throw e;
+};
+
+// ---------- Cháº¿ Ä‘á»™ ORDS: gá»i REST API tá»« Oracle 23ai ----------
+async function ords(path, method = "GET", body) {
+  const r = await fetch(CONFIG.BASE + path, {
+    method,
+    headers: body !== undefined ? { "Content-Type": "application/json" } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  let j = {};
+  try {
+    j = await r.json();
+  } catch (_) {}
+  if (!r.ok) {
+    const raw = [j.cause, j.detail, j.message, j.error]
+      .filter(Boolean)
+      .join("\n");
+    const m = /ORA-(\d+):?\s*([^\n]*)/.exec(raw);
+    raise(
+      m ? -Number(m[1]) : r.status,
+      m ? m[2].trim() : j.message || "Lá»—i káº¿t ná»‘i " + r.status,
+    );
+  }
+  return j;
+}
+
+const ordsApi = {
+  movies: () =>
+    ords("/movies").then((j) =>
+      (j.items || []).map((m) => ({
+        status: "NOW",
+        ...m,
+        metadata:
+          typeof m.metadata === "string"
+            ? JSON.parse(m.metadata)
+            : m.metadata || {},
+      })),
+    ),
+  showtimes: (id) =>
+    ords("/showtimes?movie_id=" + id).then((j) => j.items || []),
+  showtime: (id) => ords("/showtimes/" + id),
+  seatmap: (id) => ords("/seatmap/" + id).then((j) => j.items || []),
+  hold: (c, s, ids) =>
+    ords("/hold", "POST", {
+      p_customer_id: +c,
+      p_showtime_id: +s,
+      p_seat_ids: JSON.stringify(ids),
+    }),
+  confirm: (b, p, m, c) =>
+    ords("/confirm", "POST", {
+      p_booking_id: +b,
+      p_promo_code: p || null,
+      p_method: m,
+      p_combos: JSON.stringify(c || {}),
+    }),
+  cancel: (b, c) =>
+    ords("/cancel", "POST", { p_booking_id: +b, p_customer_id: +c }),
+  register: (n, e, p) =>
+    ords("/register", "POST", { p_full_name: n, p_email: e, p_password: p }),
+  revenue: () => ords("/revenue").then((j) => j.items || []),
+  audit: () =>
+    ords("/audit")
+      .then((j) => j.items || [])
+      .catch(() => []),
+  login: (e, p) => ords("/login", "POST", { p_email: e, p_password: p }),
+  myBookings: (c) =>
+    ords("/mybookings?customer_id=" + c).then((j) => j.items || []),
+  allShowtimes: () => ords("/showtimes").then((j) => j.items || []),
+  addShowtime: (m, r, t, p) =>
+    ords("/addshowtime", "POST", {
+      p_movie_id: +m,
+      p_room_id: +r,
+      p_start: new Date(t).toISOString(),
+      p_base_price: +p,
+    }),
+  rooms: () => ords("/rooms").then((j) => j.items || []),
+  theaters: () => ords("/theaters").then((j) => j.items || []),
+  requestReset: (e) => ords("/forgot", "POST", { p_email: e }),
+  resetPassword: (e, o, n) =>
+    ords("/reset", "POST", { p_email: e, p_otp: o, p_new: n }),
+  resume: (b, c) => ords("/booking/" + b + "?customer_id=" + c),
+  setRole: (c, r) => ords("/role", "POST", { p_customer_id: +c, p_role: r }),
+  reviews: (id) => ords("/reviews?movie_id=" + id).then((j) => j.items || []),
+  addReview: (c, m, r, t) =>
+    ords("/reviews", "POST", {
+      p_customer_id: +c,
+      p_movie_id: +m,
+      p_rating: +r,
+      p_content: t,
+    }),
+  combos: () => ords("/combos").then((j) => j.items || []),
+  saveCombo: (c) =>
+    ords("/combos", "POST", { name: c.name, desc: c.desc, price: +c.price }),
+  deleteCombo: (id) => ords("/combos/" + id, "DELETE"),
+  promos: () => ords("/promos").then((j) => j.items || []),
+  savePromo: (p) =>
+    ords("/promos", "POST", {
+      code: p.code,
+      type: p.type,
+      value: String(p.value),
+      max: p.max ? String(p.max) : null,
+      min: p.min ? String(p.min) : "0",
+      maxUses: p.maxUses ? String(p.maxUses) : null,
+      days: p.days || [],
+    }),
+  togglePromo: (c) => ords("/promos/" + c + "/toggle", "POST"),
+  saveMovie: (m) =>
+    ords("/movies", "POST", {
+      movie_id: m.movie_id ? +m.movie_id : null,
+      title: m.title,
+      genre: m.genre,
+      duration_min: +m.duration_min,
+      rating: m.rating,
+      status: m.status || "NOW",
+      metadata: m.metadata || null,
+    }),
+  deleteMovie: (id) => ords("/movies/" + id, "DELETE"),
+  cancelShowtime: (id) => ords("/showtimes/" + id + "/cancel", "POST"),
+  customers: () => ords("/customers").then((j) => j.items || []),
+  getProfile: (c) => ords("/profile?customer_id=" + c),
+  updateProfile: (c, d) =>
+    ords("/profile", "POST", {
+      p_customer_id: +c,
+      p_full_name: d.full_name,
+      p_phone: d.phone || null,
+      p_birth_date: d.birth || null,
+      p_gender: d.gender || null,
+      p_address: d.address || null,
+    }),
+  changePassword: (c, o, n) =>
+    ords("/password", "POST", { p_customer_id: +c, p_old: o, p_new: n }),
+  release: async () => {},
+  reset: () => {
+    localStorage.removeItem("cinema_user");
+  },
+};
+
+// ---------- Cháº¿ Ä‘á»™ MOCK: mÃ´ phá»ng láº¡i logic PL/SQL khi khÃ´ng báº­t Docker ----------
+const KEY = "cinema_db_v6";
+const hash = (t) => {
+  let h = 0;
+  for (const c of t) h = (h * 31 + c.charCodeAt(0)) | 0;
+  return String(h);
+};
+function seed() {
+  const day = (d, h) => {
+    const x = new Date();
+    x.setDate(x.getDate() + d);
+    x.setHours(h, 0, 0, 0);
+    return x.getTime();
+  };
+  const movies = [
+    {
+      movie_id: 1,
+      title: "HÃ nh Tinh Cuá»‘i CÃ¹ng",
+      genre: "Khoa há»c viá»…n tÆ°á»Ÿng",
+      duration_min: 128,
+      rating: "T13",
+      metadata: {
+        director: "A. Nguyá»…n",
+        cast: ["L. Tráº§n", "M. Pháº¡m"],
+        language: "Phá»¥ Ä‘á» Viá»‡t",
+      },
+    },
+    {
+      movie_id: 2,
+      title: "MÃ¹a HÃ¨ Cá»§a MÃ¨o",
+      genre: "Hoáº¡t hÃ¬nh",
+      duration_min: 96,
+      rating: "P",
+      metadata: { director: "K. LÃª", cast: [], language: "Lá»“ng tiáº¿ng Viá»‡t" },
+    },
+    {
+      movie_id: 3,
+      title: "ÄÃªm KhÃ´ng Ngá»§",
+      genre: "Kinh dá»‹",
+      duration_min: 110,
+      rating: "T18",
+      metadata: {
+        director: "H. VÃµ",
+        cast: ["T. Äáº·ng"],
+        language: "Tiáº¿ng Viá»‡t",
+      },
+    },
+    {
+      movie_id: 4,
+      title: "Chuyáº¿n TÃ u HoÃ ng HÃ´n",
+      genre: "TÃ¬nh cáº£m",
+      duration_min: 118,
+      rating: "T16",
+      metadata: {
+        director: "P. HoÃ ng",
+        cast: ["N. BÃ¹i", "D. NgÃ´"],
+        language: "Tiáº¿ng Viá»‡t",
+      },
+    },
+  ];
+  movies.forEach((m) => (m.status = "NOW"));
+  const soon = [
+    {
+      movie_id: 5,
+      title: "Biá»‡t Äá»™i Sao BÄƒng",
+      genre: "HÃ nh Ä‘á»™ng",
+      duration_min: 122,
+      rating: "T13",
+      status: "SOON",
+      metadata: {
+        director: "Q. Mai",
+        cast: ["V. LÃ½"],
+        language: "Phá»¥ Ä‘á» Viá»‡t",
+      },
+    },
+    {
+      movie_id: 6,
+      title: "NgÃ´i NhÃ  TrÃªn MÃ¢y",
+      genre: "Hoáº¡t hÃ¬nh",
+      duration_min: 101,
+      rating: "P",
+      status: "SOON",
+      metadata: { director: "S. Táº¡", cast: [], language: "Lá»“ng tiáº¿ng Viá»‡t" },
+    },
+  ];
+  const theaters = [
+    {
+      theater_id: 1,
+      name: "CineDB Landmark",
+      city: "TP. Há»“ ChÃ­ Minh",
+      address: "Quáº­n 1",
+    },
+    {
+      theater_id: 2,
+      name: "CineDB BÃ  Triá»‡u",
+      city: "HÃ  Ná»™i",
+      address: "Quáº­n Hai BÃ  TrÆ°ng",
+    },
+    {
+      theater_id: 3,
+      name: "CineDB SÃ´ng HÃ n",
+      city: "ÄÃ  Náºµng",
+      address: "Quáº­n Háº£i ChÃ¢u",
+    },
+    {
+      theater_id: 4,
+      name: "CineDB Thá»§ Äá»©c",
+      city: "TP. Há»“ ChÃ­ Minh",
+      address: "TP. Thá»§ Äá»©c",
+    },
+    {
+      theater_id: 5,
+      name: "CineDB Ninh Kiá»u",
+      city: "Cáº§n ThÆ¡",
+      address: "Quáº­n Ninh Kiá»u",
+    },
+    {
+      theater_id: 6,
+      name: "CineDB Láº¡ch Tray",
+      city: "Háº£i PhÃ²ng",
+      address: "Quáº­n NgÃ´ Quyá»n",
+    },
+    {
+      theater_id: 7,
+      name: "CineDB Tráº§n PhÃº",
+      city: "Nha Trang",
+      address: "ÄÆ°á»ng Tráº§n PhÃº",
+    },
+  ];
+  const rooms = [];
+  theaters.forEach((t) =>
+    ["2D", "3D"].forEach((ty, k) =>
+      rooms.push({
+        room_id: (t.theater_id - 1) * 2 + k + 1,
+        theater_id: t.theater_id,
+        theater_name: t.name,
+        name: "PhÃ²ng " + (k + 1) + " (" + ty + ")",
+      }),
+    ),
+  );
+  const seats = [];
+  "ABCDE".split("").forEach((r, i) => {
+    for (let n = 1; n <= 8; n++)
+      seats.push({
+        seat_id: i * 8 + n,
+        row_label: r,
+        seat_no: n,
+        seat_type: r === "E" ? "COUPLE" : r === "D" ? "VIP" : "STANDARD",
+      });
+  });
+  const showtimes = [];
+  let id = 1;
+  theaters.forEach((t, ti) =>
+    movies.forEach((m, i) =>
+      [1, 2].forEach((d) =>
+        [
+          [9, 19],
+          [14, 20],
+        ][i % 2].forEach((h) => {
+          const rid = ti * 2 + (i % 2) + 1;
+          showtimes.push({
+            showtime_id: id++,
+            movie_id: m.movie_id,
+            theater_id: t.theater_id,
+            theater_name: t.name,
+            room_id: rid,
+            room_name: rooms.find((r) => r.room_id === rid).name,
+            start_time: day(d, h),
+            end_time: day(d, h) + (m.duration_min + 15) * 60000,
+            base_price: i % 2 ? 100000 : 80000,
+            status: "OPEN",
+          });
+        }),
+      ),
+    ),
+  );
+  movies.push(...soon);
+  const promos = [
+    {
+      code: "WELCOME10",
+      type: "PERCENT",
+      value: 10,
+      max: 30000,
+      min: 0,
+      maxUses: 100,
+      used: 0,
+      days: null,
+    },
+    {
+      code: "GIAM50K",
+      type: "FIXED",
+      value: 50000,
+      max: null,
+      min: 200000,
+      maxUses: 50,
+      used: 0,
+      days: null,
+    },
+    {
+      code: "THU3",
+      type: "PERCENT",
+      value: 15,
+      max: 40000,
+      min: 0,
+      maxUses: null,
+      used: 0,
+      days: ["TUE"],
+    },
+  ];
+  return {
+    theaters,
+    rooms,
+    movies,
+    seats,
+    showtimes,
+    promos,
+    combos: [
+      {
+        combo_id: 1,
+        name: "Combo Báº¯p NÆ°á»›c",
+        desc: "1 báº¯p lá»›n vÃ  1 nÆ°á»›c",
+        price: 79000,
+      },
+      {
+        combo_id: 2,
+        name: "Combo ÄÃ´i",
+        desc: "2 báº¯p vÃ  2 nÆ°á»›c",
+        price: 129000,
+      },
+      { combo_id: 3, name: "NÆ°á»›c ngá»t", desc: "Ly lá»›n", price: 29000 },
+    ],
+    customers: [
+      {
+        customer_id: 1,
+        full_name: "Quáº£n trá»‹ viÃªn",
+        email: "admin@cinedb.vn",
+        pw: hash("Admin123"),
+        role: "ADMIN",
+      },
+    ],
+    reviews: [],
+    bookings: [],
+    audit: [],
+    ss: {},
+    nextBooking: 1,
+  };
+}
+let db = JSON.parse(localStorage.getItem(KEY) || "null") || seed();
+const save = () => localStorage.setItem(KEY, JSON.stringify(db));
+const stOf = (id) =>
+  db.showtimes.find((s) => s.showtime_id == id) ||
+  raise(-20001, "Suáº¥t chiáº¿u hoáº·c gháº¿ khÃ´ng tá»“n táº¡i");
+const seatOf = (id) => db.seats.find((s) => s.seat_id == id);
+const lab = (id) => seatOf(id).row_label + seatOf(id).seat_no;
+const bookingOf = (id) =>
+  db.bookings.find((b) => b.booking_id == id) ||
+  raise(-20020, "ÄÆ¡n khÃ´ng tá»“n táº¡i");
+const log = (b, o, n) =>
+  db.audit.push({
+    log_id: db.audit.length + 1,
+    table_name: "BOOKING",
+    record_id: b.booking_id,
+    action: "STATUS_CHANGE",
+    old_value: o,
+    new_value: n,
+    changed_at: Date.now(),
+  });
+
+function price(st, seat) {
+  let p = st.base_price * ({ VIP: 1.25, COUPLE: 2 }[seat.seat_type] || 1);
+  const d = new Date(st.start_time);
+  if (d.getDay() === 0 || d.getDay() === 6) p *= 1.15;
+  if (d.getHours() < 12) p *= 0.8;
+  return Math.round(p / 1000) * 1000;
+}
+function discount(code, sub, st) {
+  if (!code) return 0;
+  const p = db.promos.find((x) => x.code === code.toUpperCase());
+  if (!p || p.active === false) raise(-20034, "MÃ£ khuyáº¿n mÃ£i khÃ´ng tá»“n táº¡i");
+  if (p.maxUses != null && p.used >= p.maxUses)
+    raise(-20031, "MÃ£ khuyáº¿n mÃ£i Ä‘Ã£ háº¿t lÆ°á»£t dÃ¹ng");
+  if (sub < p.min) raise(-20032, "ChÆ°a Ä‘áº¡t giÃ¡ trá»‹ Ä‘Æ¡n tá»‘i thiá»ƒu");
+  if (
+    p.days &&
+    !p.days.includes(
+      ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"][
+        new Date(st.start_time).getDay()
+      ],
+    )
+  )
+    raise(-20033, "MÃ£ khÃ´ng Ã¡p dá»¥ng cho ngÃ y chiáº¿u nÃ y");
+  let d = p.type === "PERCENT" ? (sub * p.value) / 100 : p.value;
+  if (p.max != null) d = Math.min(d, p.max);
+  return Math.min(Math.round(d / 1000) * 1000, sub);
+}
+function releaseExpired() {
+  const n = Date.now();
+  for (const k in db.ss)
+    if (db.ss[k].status === "HELD" && db.ss[k].exp < n) delete db.ss[k];
+  db.bookings.forEach((b) => {
+    if (b.status === "PENDING" && b.exp < n) {
+      log(b, "PENDING", "EXPIRED");
+      b.status = "EXPIRED";
+    }
+  });
+  save();
+}
+const freeSeats = (bid) => {
+  for (const k in db.ss) if (db.ss[k].bookingId === bid) delete db.ss[k];
+};
+if (CONFIG.MODE === "mock") setInterval(releaseExpired, 60000);
+
+const mockApi = {
+  async movies() {
+    return db.movies.map((m) => {
+      const r = (db.reviews || []).filter((x) => x.movie_id === m.movie_id);
+      return {
+        ...m,
+        review_count: r.length,
+        avg_rating: r.length
+          ? r.reduce((a, x) => a + x.rating, 0) / r.length
+          : 0,
+      };
+    });
+  },
+  async showtime(id) {
+    const s = stOf(id);
+    return {
+      ...s,
+      title: db.movies.find((m) => m.movie_id === s.movie_id).title,
+    };
+  },
+  async showtimes(mid) {
+    return db.showtimes
+      .filter(
+        (s) =>
+          s.movie_id == mid && s.start_time > Date.now() && s.status === "OPEN",
+      )
+      .map((s) => {
+        const sold = Object.keys(db.ss).filter(
+          (k) =>
+            k.startsWith(s.showtime_id + "-") && db.ss[k].status === "SOLD",
+        ).length;
+        return { ...s, occupancy: Math.round((100 * sold) / db.seats.length) };
+      });
+  },
+  async seatmap(id) {
+    const st = stOf(id);
+    return db.seats.map((s) => {
+      const v = db.ss[id + "-" + s.seat_id];
+      const status =
+        !v || (v.status === "HELD" && v.exp < Date.now())
+          ? "AVAILABLE"
+          : v.status;
+      return { ...s, status, price: price(st, s) };
+    });
+  },
+  async hold(cid, stId, ids) {
+    const st = stOf(stId);
+    if (st.status !== "OPEN" || st.start_time <= Date.now())
+      raise(-20012, "Suáº¥t chiáº¿u Ä‘Ã£ Ä‘Ã³ng bÃ¡n");
+    if (!ids || ids.length < 1 || ids.length > 8)
+      raise(-20010, "Má»—i Ä‘Æ¡n Ä‘áº·t tá»« 1 Ä‘áº¿n 8 gháº¿");
+    const snap = JSON.stringify(db.ss),
+      exp = Date.now() + HOLD_MS,
+      bid = db.nextBooking;
+    for (const sid of [...ids].sort((a, b) => a - b)) {
+      const v = db.ss[stId + "-" + sid];
+      if (!v || (v.status === "HELD" && v.exp < Date.now()))
+        db.ss[stId + "-" + sid] = {
+          status: "HELD",
+          heldBy: cid,
+          exp,
+          bookingId: bid,
+        };
+      else {
+        db.ss = JSON.parse(snap);
+        raise(-20011, "Gháº¿ " + lab(sid) + " Ä‘Ã£ cÃ³ ngÆ°á»i giá»¯ hoáº·c Ä‘Ã£ bÃ¡n");
+      }
+    }
+    db.bookings.push({
+      booking_id: bid,
+      customer_id: cid,
+      showtime_id: stId,
+      status: "PENDING",
+      exp,
+      tickets: [],
+    });
+    db.nextBooking++;
+    save();
+    return { booking_id: bid, expires_at: exp };
+  },
+  async confirm(bid, code, method, cmb = {}) {
+    const b = bookingOf(bid),
+      n = Date.now();
+    if (b.status !== "PENDING" || b.exp < n)
+      raise(-20020, "ÄÆ¡n khÃ´ng cÃ²n hiá»‡u lá»±c");
+    const mine = Object.entries(db.ss).filter(([, v]) => v.bookingId === bid);
+    if (!mine.length || mine.some(([, v]) => v.status !== "HELD" || v.exp < n))
+      raise(-20021, "CÃ³ gháº¿ Ä‘Ã£ háº¿t háº¡n giá»¯ chá»—");
+    const st = stOf(b.showtime_id);
+    const tickets = mine.map(([k]) => {
+      const s = seatOf(+k.split("-")[1]);
+      return {
+        seat_id: s.seat_id,
+        seat_label: s.row_label + s.seat_no,
+        price: price(st, s),
+      };
+    });
+    const sub = tickets.reduce((a, t) => a + t.price, 0),
+      disc = discount(code, sub, st);
+    const cl = db.combos
+        .filter((c) => cmb[c.combo_id] > 0)
+        .map((c) => ({ name: c.name, qty: cmb[c.combo_id], price: c.price })),
+      ct = cl.reduce((a, c) => a + c.qty * c.price, 0);
+    if (disc > 0) db.promos.find((p) => p.code === code.toUpperCase()).used++;
+    mine.forEach(([k]) => {
+      db.ss[k] = { status: "SOLD", bookingId: bid };
+    });
+    log(b, "PENDING", "PAID");
+    Object.assign(b, {
+      status: "PAID",
+      tickets,
+      subtotal: sub,
+      discount_amount: disc,
+      final_amount: sub - disc + ct,
+      combos: cl,
+      promo: disc > 0 ? code.toUpperCase() : null,
+      method,
+    });
+    save();
+    return {
+      booking_id: bid,
+      subtotal: sub,
+      discount_amount: disc,
+      final_amount: sub - disc + ct,
+      combos: cl,
+      tickets,
+    };
+  },
+  async cancel(bid, cid) {
+    const b = bookingOf(bid);
+    if (b.customer_id !== cid) raise(-20040, "KhÃ´ng cÃ³ quyá»n huá»· Ä‘Æ¡n nÃ y");
+    if (!["PENDING", "PAID"].includes(b.status))
+      raise(-20041, "ÄÆ¡n khÃ´ng thá»ƒ huá»· á»Ÿ tráº¡ng thÃ¡i hiá»‡n táº¡i");
+    if (b.status === "PAID") {
+      if (stOf(b.showtime_id).start_time < Date.now() + 2 * 3600e3)
+        raise(-20042, "Chá»‰ huá»· vÃ© Ä‘Ã£ thanh toÃ¡n trÆ°á»›c giá» chiáº¿u Ã­t nháº¥t 2 giá»");
+      if (b.promo) {
+        const p = db.promos.find((x) => x.code === b.promo);
+        p.used = Math.max(0, p.used - 1);
+      }
+      b.tickets = [];
+    }
+    freeSeats(bid);
+    log(b, b.status, "CANCELLED");
+    b.status = "CANCELLED";
+    save();
+  },
+  async register(n, e, p) {
+    if (
+      !(p.length >= 8 && /[A-Z]/.test(p) && /[a-z]/.test(p) && /[0-9]/.test(p))
+    )
+      raise(
+        -20060,
+        "Máº­t kháº©u pháº£i cÃ³ Ã­t nháº¥t 8 kÃ½ tá»±, gá»“m chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  sá»‘",
+      );
+    if (db.customers.some((c) => c.email === e))
+      raise(-20061, "Email Ä‘Ã£ Ä‘Æ°á»£c Ä‘Äƒng kÃ½");
+    const c = {
+      customer_id: db.customers.length + 1,
+      full_name: n,
+      email: e,
+      pw: hash(p),
+      role: "CUSTOMER",
+    };
+    db.customers.push(c);
+    save();
+    return { customer_id: c.customer_id };
+  },
+  async revenue() {
+    const m = {};
+    db.bookings
+      .filter((b) => b.status === "PAID")
+      .forEach((b) =>
+        b.tickets.forEach((t) => {
+          const st = stOf(b.showtime_id),
+            mv = db.movies.find((x) => x.movie_id === st.movie_id),
+            d = new Date(st.start_time).setHours(0, 0, 0, 0),
+            k = mv.movie_id + "-" + d;
+          m[k] = m[k] || {
+            title: mv.title,
+            show_date: d,
+            tickets_sold: 0,
+            gross_revenue: 0,
+          };
+          m[k].tickets_sold++;
+          m[k].gross_revenue += t.price;
+        }),
+      );
+    return Object.values(m);
+  },
+  async audit() {
+    return db.audit;
+  },
+  async login(e, p) {
+    const c = db.customers.find((x) => x.email === e && x.pw === hash(p));
+    if (!c) raise(-20062, "Email hoáº·c máº­t kháº©u khÃ´ng Ä‘Ãºng");
+    return { customer_id: c.customer_id, full_name: c.full_name, role: c.role };
+  },
+  async myBookings(cid) {
+    releaseExpired();
+    return db.bookings
+      .filter((b) => b.customer_id === cid)
+      .map((b) => {
+        const st = stOf(b.showtime_id),
+          cur = Object.entries(db.ss)
+            .filter(([, v]) => v.bookingId === b.booking_id)
+            .map(([k]) => lab(+k.split("-")[1]));
+        return {
+          booking_id: b.booking_id,
+          status: b.status,
+          title: db.movies.find((m) => m.movie_id === st.movie_id).title,
+          start_time: st.start_time,
+          room_name: st.room_name,
+          seats: (cur.length
+            ? cur
+            : (b.tickets || []).map((t) => t.seat_label)
+          ).join(", "),
+          final_amount: b.final_amount || 0,
+          showtime_id: b.showtime_id,
+          subtotal: b.subtotal,
+          discount_amount: b.discount_amount,
+          combos: b.combos,
+          tickets: b.tickets,
+          exp: b.exp,
+        };
+      })
+      .reverse();
+  },
+  async allShowtimes() {
+    return db.showtimes.map((s) => {
+      const sold = Object.keys(db.ss).filter(
+        (k) => k.startsWith(s.showtime_id + "-") && db.ss[k].status === "SOLD",
+      ).length;
+      return {
+        ...s,
+        title: db.movies.find((m) => m.movie_id === s.movie_id).title,
+        occupancy: Math.round((100 * sold) / db.seats.length),
+      };
+    });
+  },
+  async addShowtime(mid, rid, start, price) {
+    const m = db.movies.find((x) => x.movie_id == mid),
+      end = start + (m.duration_min + 15) * 60000;
+    if (
+      db.showtimes.some(
+        (s) =>
+          s.room_id == rid &&
+          s.status !== "CANCELLED" &&
+          s.start_time < end &&
+          s.end_time > start,
+      )
+    )
+      raise(-20050, "PhÃ²ng Ä‘Ã£ cÃ³ suáº¥t chiáº¿u trÃ¹ng giá»");
+    const id = Math.max(...db.showtimes.map((s) => s.showtime_id)) + 1;
+    const R = db.rooms.find((r) => r.room_id == rid);
+    db.showtimes.push({
+      showtime_id: id,
+      movie_id: +mid,
+      room_id: +rid,
+      theater_id: R.theater_id,
+      theater_name: R.theater_name,
+      room_name: R.name,
+      start_time: start,
+      end_time: end,
+      base_price: +price,
+      status: "OPEN",
+    });
+    save();
+    return { showtime_id: id };
+  },
+  async rooms() {
+    return db.rooms;
+  },
+  async resume(bid, cid) {
+    const b = bookingOf(bid);
+    if (b.customer_id !== cid) raise(-20040, "KhÃ´ng cÃ³ quyá»n vá»›i Ä‘Æ¡n nÃ y");
+    if (b.status !== "PENDING" || b.exp < Date.now())
+      raise(-20020, "ÄÆ¡n khÃ´ng cÃ²n hiá»‡u lá»±c");
+    return {
+      booking_id: bid,
+      expires_at: b.exp,
+      showtime_id: b.showtime_id,
+      seat_ids: Object.entries(db.ss)
+        .filter(([, v]) => v.bookingId === bid)
+        .map(([k]) => +k.split("-")[1]),
+    };
+  },
+  async setRole(cid, role) {
+    db.customers.find((c) => c.customer_id === cid).role = role;
+    save();
+  },
+  async reviews(mid) {
+    return (db.reviews || [])
+      .filter((r) => r.movie_id == mid)
+      .sort((a, b) => b.at - a.at);
+  },
+  async addReview(cid, mid, rating, text) {
+    if (!(rating >= 1 && rating <= 5))
+      raise(-20080, "Äiá»ƒm Ä‘Ã¡nh giÃ¡ tá»« 1 Ä‘áº¿n 5");
+    const c = db.customers.find((x) => x.customer_id === cid);
+    db.reviews = (db.reviews || []).filter(
+      (r) => !(r.movie_id == mid && r.customer_id === cid),
+    );
+    db.reviews.push({
+      review_id: Date.now(),
+      movie_id: +mid,
+      customer_id: cid,
+      name: c.full_name,
+      rating: +rating,
+      text,
+      at: Date.now(),
+    });
+    save();
+  },
+  async requestReset(e) {
+    const c = db.customers.find((x) => x.email === e);
+    if (!c) raise(-20063, "Email chÆ°a Ä‘Æ°á»£c Ä‘Äƒng kÃ½");
+    c.otp = String(Math.floor(100000 + Math.random() * 900000));
+    c.otpExp = Date.now() + 10 * 60000;
+    save();
+    return { otp: c.otp };
+  },
+  async resetPassword(e, otp, np) {
+    const c = db.customers.find((x) => x.email === e);
+    if (!c || c.otp !== otp || c.otpExp < Date.now())
+      raise(-20064, "MÃ£ OTP khÃ´ng Ä‘Ãºng hoáº·c Ä‘Ã£ háº¿t háº¡n");
+    if (
+      !(
+        np.length >= 8 &&
+        /[A-Z]/.test(np) &&
+        /[a-z]/.test(np) &&
+        /[0-9]/.test(np)
+      )
+    )
+      raise(
+        -20060,
+        "Máº­t kháº©u má»›i pháº£i cÃ³ Ã­t nháº¥t 8 kÃ½ tá»±, gá»“m chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  sá»‘",
+      );
+    c.pw = hash(np);
+    delete c.otp;
+    save();
+  },
+  async theaters() {
+    return db.theaters;
+  },
+  async combos() {
+    return db.combos;
+  },
+  async saveCombo(c) {
+    db.combos.push({
+      combo_id: Math.max(0, ...db.combos.map((x) => x.combo_id)) + 1,
+      name: c.name,
+      desc: c.desc,
+      price: +c.price,
+    });
+    save();
+  },
+  async deleteCombo(id) {
+    db.combos = db.combos.filter((c) => c.combo_id != id);
+    save();
+  },
+  async promos() {
+    return db.promos;
+  },
+  async savePromo(p) {
+    const code = p.code.toUpperCase();
+    if (db.promos.some((x) => x.code === code))
+      raise(-20070, "MÃ£ khuyáº¿n mÃ£i Ä‘Ã£ tá»“n táº¡i");
+    db.promos.push({
+      code,
+      type: p.type,
+      value: +p.value,
+      max: p.max ? +p.max : null,
+      min: +p.min || 0,
+      maxUses: p.maxUses ? +p.maxUses : null,
+      used: 0,
+      days: p.days.length ? p.days : null,
+      active: true,
+    });
+    save();
+  },
+  async togglePromo(code) {
+    const p = db.promos.find((x) => x.code === code);
+    p.active = p.active === false;
+    save();
+  },
+  async saveMovie(m) {
+    if (m.movie_id)
+      Object.assign(
+        db.movies.find((x) => x.movie_id == m.movie_id),
+        m,
+      );
+    else
+      db.movies.push({
+        ...m,
+        movie_id: Math.max(...db.movies.map((x) => x.movie_id)) + 1,
+      });
+    save();
+  },
+  async deleteMovie(id) {
+    if (db.showtimes.some((s) => s.movie_id == id))
+      raise(-20052, "Phim Ä‘Ã£ cÃ³ suáº¥t chiáº¿u, hÃ£y Ä‘á»•i tráº¡ng thÃ¡i thay vÃ¬ xoÃ¡");
+    db.movies = db.movies.filter((m) => m.movie_id != id);
+    save();
+  },
+  async cancelShowtime(id) {
+    if (Object.keys(db.ss).some((k) => k.startsWith(id + "-")))
+      raise(-20051, "Suáº¥t Ä‘Ã£ cÃ³ ngÆ°á»i giá»¯ hoáº·c mua vÃ©, khÃ´ng thá»ƒ huá»·");
+    stOf(id).status = "CANCELLED";
+    save();
+  },
+  async customers() {
+    return db.customers;
+  },
+  async getProfile(cid) {
+    const c = db.customers.find((x) => x.customer_id === cid);
+    return {
+      customer_id: c.customer_id,
+      full_name: c.full_name,
+      email: c.email,
+      phone: c.phone || "",
+      birth: c.birth || "",
+      gender: c.gender || "",
+      address: c.address || "",
+    };
+  },
+  async updateProfile(cid, d) {
+    if (d.phone && !/^(0|\+84)\d{9,10}$/.test(d.phone.replace(/\s/g, "")))
+      raise(-20065, "Sá»‘ Ä‘iá»‡n thoáº¡i khÃ´ng há»£p lá»‡");
+    if (d.birth && new Date(d.birth) > new Date())
+      raise(-20066, "NgÃ y sinh khÃ´ng há»£p lá»‡");
+    Object.assign(
+      db.customers.find((x) => x.customer_id === cid),
+      {
+        full_name: d.full_name,
+        phone: d.phone,
+        birth: d.birth,
+        gender: d.gender,
+        address: d.address,
+      },
+    );
+    save();
+  },
+  async changePassword(cid, oldp, newp) {
+    const c = db.customers.find((x) => x.customer_id === cid);
+    if (c.pw !== hash(oldp)) raise(-20062, "Máº­t kháº©u hiá»‡n táº¡i khÃ´ng Ä‘Ãºng");
+    if (
+      !(
+        newp.length >= 8 &&
+        /[A-Z]/.test(newp) &&
+        /[a-z]/.test(newp) &&
+        /[0-9]/.test(newp)
+      )
+    )
+      raise(
+        -20060,
+        "Máº­t kháº©u má»›i pháº£i cÃ³ Ã­t nháº¥t 8 kÃ½ tá»±, gá»“m chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  sá»‘",
+      );
+    c.pw = hash(newp);
+    save();
+  },
+  async release() {
+    releaseExpired();
+  },
+  reset() {
+    localStorage.removeItem(KEY);
+    localStorage.removeItem("cinema_user");
+  },
+};
+const API = CONFIG.MODE === "ords" ? ordsApi : mockApi;
+
+
+===== C:\Users\Khai\cinema-booking\js\site.js =====
+const IMGBB_API_KEY = "848356f9c5214572f89c23e305b8cc8f";
+
+const $ = (s) => document.querySelector(s),
+  app = $("#app"),
+  qs = new URLSearchParams(location.search);
+const money = (n) => Number(n || 0).toLocaleString("vi-VN") + "Ä‘";
+const toDate = (t) =>
+  new Date(typeof t === "number" ? t : /^\d+$/.test(String(t)) ? Number(t) : t);
+const fDate = (t) =>
+  toDate(t).toLocaleDateString("vi-VN", {
+    weekday: "short",
+    day: "2-digit",
+    month: "2-digit",
+  });
+const fTime = (t) =>
+  toDate(t).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+let user = JSON.parse(localStorage.getItem("cinema_user") || "null"),
+  timer;
+function toast(m, bad) {
+  const t = $("#toast");
+  t.textContent = m;
+  t.className = "toast" + (bad ? " bad" : "");
+  t.hidden = false;
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => (t.hidden = true), 3500);
+}
+const showErr = (e) => toast("Lá»—i " + (e.code ?? "") + ": " + e.message, true);
+const on = (s, f) => {
+  const e = $(s);
+  if (e) e.onclick = f;
+};
+const EYE =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.9 17.9A10.9 10.9 0 0 1 12 19C5 19 1 12 1 12a18.5 18.5 0 0 1 5.1-5.9M9.9 4.2A9.1 9.1 0 0 1 12 5c7 0 11 7 11 7a18.5 18.5 0 0 1-2.2 3.2M1 1l22 22"/></svg>';
+const pwField = (n, l) =>
+  `<label class="f">${l}<span class="pw"><input name="${n}" type="password" required><button type="button" class="eye" data-eye aria-label="Hiá»‡n máº­t kháº©u">${EYE}</button></span></label>`;
+function bindEyes() {
+  document.querySelectorAll("[data-eye]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const i = b.previousElementSibling,
+          show = i.type === "password";
+        i.type = show ? "text" : "password";
+        b.innerHTML = show ? EYE_OFF : EYE;
+        b.setAttribute("aria-label", show ? "áº¨n máº­t kháº©u" : "Hiá»‡n máº­t kháº©u");
+      }),
+  );
+}
+const NEWS = [
+  {
+    id: 1,
+    date: "05/11/2026",
+    title: "Giá»¯ gháº¿ 10 phÃºt: Ä‘áº·t vÃ© khÃ´ng lo bá»‹ giÃ nh chá»—",
+    body: "Khi báº¡n chá»n gháº¿, há»‡ thá»‘ng giá»¯ chá»— trong 10 phÃºt. Háº¿t thá»i gian mÃ  chÆ°a thanh toÃ¡n, gháº¿ tá»± Ä‘á»™ng trá»Ÿ vá» trá»‘ng Ä‘á»ƒ ngÆ°á»i khÃ¡c cÃ³ thá»ƒ Ä‘áº·t. Má»—i Ä‘Æ¡n Ä‘áº·t tá»‘i Ä‘a 8 gháº¿.",
+  },
+  {
+    id: 2,
+    date: "03/11/2026",
+    title: "Thá»© Ba Ä‘á»“ng giÃ¡ vá»›i mÃ£ THU3",
+    body: "Nháº­p mÃ£ THU3 khi thanh toÃ¡n Ä‘á»ƒ giáº£m 15% (tá»‘i Ä‘a 40.000Ä‘) cho cÃ¡c suáº¥t chiáº¿u vÃ o thá»© Ba. MÃ£ khÃ´ng Ã¡p dá»¥ng cho cÃ¡c ngÃ y khÃ¡c trong tuáº§n.",
+  },
+  {
+    id: 3,
+    date: "01/11/2026",
+    title: "Suáº¥t sá»›m giáº£m 20% má»—i ngÃ y",
+    body: "CÃ¡c suáº¥t chiáº¿u báº¯t Ä‘áº§u trÆ°á»›c 12 giá» trÆ°a Ä‘Æ°á»£c giáº£m 20% giÃ¡ vÃ© tá»± Ä‘á»™ng, khÃ´ng cáº§n nháº­p mÃ£. Cuá»‘i tuáº§n giÃ¡ vÃ© Ä‘Æ°á»£c phá»¥ thu 15%.",
+  },
+  {
+    id: 4,
+    date: "28/10/2026",
+    title: "Combo báº¯p nÆ°á»›c Ä‘áº·t cÃ¹ng vÃ©",
+    body: "Sau khi giá»¯ gháº¿, báº¡n cÃ³ thá»ƒ chá»n thÃªm combo báº¯p nÆ°á»›c ngay trong bÆ°á»›c thanh toÃ¡n. Combo Ä‘Æ°á»£c cá»™ng vÃ o tá»•ng tiá»n cá»§a Ä‘Æ¡n vÃ  khÃ´ng bá»‹ tÃ­nh vÃ o má»©c giáº£m cá»§a mÃ£ khuyáº¿n mÃ£i.",
+  },
+  {
+    id: 5,
+    date: "25/10/2026",
+    title: "Quy Ä‘á»‹nh huá»· vÃ© vÃ  hoÃ n tiá»n",
+    body: "ÄÆ¡n chÆ°a thanh toÃ¡n cÃ³ thá»ƒ huá»· báº¥t ká»³ lÃºc nÃ o. VÃ© Ä‘Ã£ thanh toÃ¡n chá»‰ huá»· Ä‘Æ°á»£c khi cÃ²n Ã­t nháº¥t 2 giá» trÆ°á»›c giá» chiáº¿u vÃ  Ä‘Æ°á»£c hoÃ n 100% sá»‘ tiá»n Ä‘Ã£ tráº£.",
+  },
+];
+const esc = (t) =>
+  String(t).replace(
+    /[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+  );
+
+async function uploadImgBB(file) {
+  if (!IMGBB_API_KEY || IMGBB_API_KEY === "DAN_API_KEY_IMGBB_CUA_BAN_VAO_DAY") {
+    throw new Error("Báº¡n chÆ°a dÃ¡n API Key cá»§a ImgBB vÃ o Ä‘áº§u file js/site.js");
+  }
+  const fd = new FormData();
+  fd.append("image", file);
+  const res = await fetch(
+    `https://api.imgbb.com/1/upload?key=${IMGBB_API_KEY}`,
+    {
+      method: "POST",
+      body: fd,
+    },
+  );
+  const data = await res.json();
+  if (!data.success) {
+    throw new Error(data.error?.message || "Táº£i áº£nh lÃªn ImgBB tháº¥t báº¡i");
+  }
+  return data.data.display_url;
+}
+
+const poster = (m) => {
+  const meta =
+    typeof m.metadata === "string"
+      ? JSON.parse(m.metadata || "{}")
+      : m.metadata || {};
+  const url = meta.poster;
+  return `<div class="poster" style="--h:${(Number(m.movie_id || 0) * 67) % 360};position:relative;overflow:hidden"><i class="age" style="z-index:2">${m.rating || ""}</i>${m.review_count ? `<i class="star" style="z-index:2">â˜… ${Number(m.avg_rating || 0).toFixed(1)}</i>` : ""}<span class="ini">${(m.title || "?")[0]}</span><b>${m.title || ""}</b>${url ? `<img src="${esc(url)}" alt="${esc(m.title || "")}" onerror="this.remove()" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1">` : ""}</div>`;
+};
+
+function layout() {
+  const cur = location.pathname.split("/").pop() || "index.html",
+    L = [
+      ["phim.html", "Phim"],
+      ["rap.html", "Ráº¡p"],
+      ["uu-dai.html", "Æ¯u Ä‘Ã£i"],
+      ["tin-tuc.html", "Tin tá»©c"],
+      ["ve-cua-toi.html", "VÃ© cá»§a tÃ´i"],
+    ];
+  $("#hdr").innerHTML =
+    `<header class="hd"><div class="wrap hbar"><a class="logo" href="index.html">Cine<span>DB</span></a><button class="burger" aria-label="Má»Ÿ menu" onclick="this.closest('.hd').classList.toggle('open')">â˜°</button><nav class="nav">${L.map(([h, t]) => `<a href="${h}" class="${cur === h ? "on" : ""}">${t}</a>`).join("")}</nav><form class="srch" action="phim.html"><input name="q" placeholder="TÃ¬m phim" aria-label="TÃ¬m phim"></form><div class="acc">${user ? `<a class="pill" href="ho-so.html">${esc(user.name)}</a>${user.role === "ADMIN" ? '<a class="btn sm" href="quan-tri.html">Trang quáº£n trá»‹</a>' : '<a class="btn sm alt" href="quan-tri-dang-nhap.html">Quáº£n trá»‹ viÃªn</a>'}` : '<a class="btn sm" href="dang-nhap.html">ÄÄƒng nháº­p</a><a class="btn sm alt" href="quan-tri-dang-nhap.html">Quáº£n trá»‹ viÃªn</a>'}</div></div></header>`;
+  $("#ftr").innerHTML =
+    `<footer><div class="wrap"><div><h4>CineDB Viá»‡t Nam</h4><p>Há»‡ thá»‘ng Ä‘áº·t vÃ© xem phim trá»±c tuyáº¿n. Äá»“ Ã¡n mÃ´n CÃ¡c há»‡ quáº£n trá»‹ cÆ¡ sá»Ÿ dá»¯ liá»‡u, Oracle Database 23ai (Äá» tÃ i 6).</p></div><div><h4>Xem phim</h4><a href="phim.html">Phim Ä‘ang chiáº¿u</a><a href="phim.html?tab=soon">Phim sáº¯p chiáº¿u</a><a href="rap.html">Ráº¡p chiáº¿u phim</a><a href="uu-dai.html">Æ¯u Ä‘Ã£i</a></div><div><h4>TÃ i khoáº£n</h4><a href="dang-nhap.html">ÄÄƒng nháº­p</a><a href="thanh-vien.html">ÄÄƒng kÃ½</a><a href="ho-so.html">Há»“ sÆ¡ cÃ¡ nhÃ¢n</a><a href="ve-cua-toi.html">VÃ© cá»§a tÃ´i</a><a href="quan-tri-dang-nhap.html">Quáº£n trá»‹ viÃªn</a></div><div><h4>ChÃ­nh sÃ¡ch</h4><p>Giá»¯ gháº¿ 10 phÃºt. Huá»· vÃ© Ä‘Ã£ thanh toÃ¡n trÆ°á»›c giá» chiáº¿u Ã­t nháº¥t 2 giá», hoÃ n 100%.</p></div></div><div class="wrap muted">Â© 2026 CineDB. Giao diá»‡n mang tÃ­nh minh hoáº¡, khÃ´ng pháº£i trang chÃ­nh thá»©c cá»§a báº¥t ká»³ há»‡ thá»‘ng ráº¡p nÃ o.</div></footer>`;
+}
+
+// ----- khá»‘i danh sÃ¡ch phim cÃ³ tab Äang chiáº¿u / Sáº¯p chiáº¿u -----
+function movieBlock(ms, tab) {
+  const list = ms.filter((m) => m.status === (tab === "soon" ? "SOON" : "NOW"));
+  return `<div class="tabs"><button data-t="now" class="${tab === "soon" ? "" : "on"}">Äang chiáº¿u</button><button data-t="soon" class="${tab === "soon" ? "on" : ""}">Sáº¯p chiáº¿u</button></div>
+  <div class="grid">${list.map((m) => `<article class="card"><a href="chi-tiet.html?id=${m.movie_id}">${poster(m)}</a><div class="cb"><h3><a href="chi-tiet.html?id=${m.movie_id}">${m.title}</a></h3><div class="muted small">${m.genre} Â· ${m.duration_min} phÃºt</div><a class="btn ${tab === "soon" ? "alt" : ""}" href="chi-tiet.html?id=${m.movie_id}">${tab === "soon" ? "Chi tiáº¿t" : "Mua vÃ©"}</a></div></article>`).join("") || '<p class="muted">KhÃ´ng tÃ¬m tháº¥y phim phÃ¹ há»£p.</p>'}</div>`;
+}
+function mountMovies(box, ms, tab) {
+  box.innerHTML = movieBlock(ms, tab);
+  box.dataset.tab = tab || "";
+  box
+    .querySelectorAll(".tabs button")
+    .forEach((b) => (b.onclick = () => mountMovies(box, ms, b.dataset.t)));
+}
+
+async function pHome() {
+  const ms = await API.movies(),
+    now = ms.filter((m) => m.status === "NOW"),
+    feat = now.slice(0, 3);
+  app.innerHTML = `<section class="hero" id="hero"><div class="wrap hero-in"><div><span class="chip2">Phim ná»•i báº­t</span><h1 id="h-t"></h1><p class="meta" id="h-m"></p><p class="lead" id="h-d"></p><div class="acts"><a class="btn" id="h-b">Mua vÃ© ngay</a><a class="btn ghost" id="h-i">Xem chi tiáº¿t</a></div><div class="dots">${feat.map(() => "<i></i>").join("")}</div></div><div class="hero-poster" id="h-p"></div></div></section>
+  <div class="wrap"><div class="qbar"><b>Äáº·t vÃ© nhanh</b><select id="qm" aria-label="Chá»n phim"><option value="">1. Chá»n phim</option>${now.map((m) => `<option value="${m.movie_id}">${m.title}</option>`).join("")}</select><select id="qs" disabled aria-label="Chá»n suáº¥t chiáº¿u"><option value="">2. Chá»n suáº¥t chiáº¿u</option></select><button class="btn" id="qgo" disabled>Mua vÃ© ngay</button></div></div>
+  <div class="wrap"><h2 class="t">Phim</h2><div id="mv"></div></div>
+  <div class="wrap"><h2 class="t">Tin má»›i</h2><div class="grid">${NEWS.slice(
+    0,
+    3,
+  )
+    .map(
+      (x) =>
+        `<a class="box" href="tin-tuc.html?id=${x.id}"><h3>${x.title}</h3><p class="muted small">${x.date}</p></a>`,
+    )
+    .join("")}</div></div>`;
+  mountMovies($("#mv"), ms, "now");
+  let i = 0;
+  const show = (k) => {
+    i = k;
+    const m = feat[k],
+      d =
+        typeof m.metadata === "string"
+          ? JSON.parse(m.metadata || "{}")
+          : m.metadata || {};
+    $("#hero").style.setProperty("--h", (m.movie_id * 67) % 360);
+    $("#h-t").textContent = m.title;
+    $("#h-m").textContent =
+      m.genre + " Â· " + m.duration_min + " phÃºt Â· " + m.rating;
+    $("#h-d").textContent = d.director
+      ? "Äáº¡o diá»…n " + d.director + (d.language ? ", " + d.language : "")
+      : "";
+    $("#h-b").href = $("#h-i").href = "chi-tiet.html?id=" + m.movie_id;
+    $("#h-p").innerHTML = poster(m);
+    document
+      .querySelectorAll(".dots i")
+      .forEach((x, j) => (x.className = j === k ? "on" : ""));
+  };
+  document
+    .querySelectorAll(".dots i")
+    .forEach((x, j) => (x.onclick = () => show(j)));
+  if (feat.length) {
+    show(0);
+    setInterval(() => show((i + 1) % feat.length), 5000);
+  }
+  $("#qm").onchange = async (e) => {
+    const ss = e.target.value ? await API.showtimes(e.target.value) : [];
+    $("#qs").innerHTML =
+      '<option value="">2. Chá»n suáº¥t chiáº¿u</option>' +
+      ss
+        .map(
+          (s) =>
+            `<option value="${s.showtime_id}">${fDate(s.start_time)} ${fTime(s.start_time)}, ${s.theater_name || ""}, ${s.room_name}</option>`,
+        )
+        .join("");
+    $("#qs").disabled = !ss.length;
+    $("#qgo").disabled = true;
+  };
+  $("#qs").onchange = (e) => ($("#qgo").disabled = !e.target.value);
+  on("#qgo", () => (location.href = "dat-ve.html?st=" + $("#qs").value));
+}
+
+async function pPhim() {
+  const ms = await API.movies(),
+    genres = [...new Set(ms.map((m) => m.genre))];
+  app.innerHTML = `<div class="wrap"><h1 class="t">Phim</h1><div style="display:flex;gap:.6rem;justify-content:center;flex-wrap:wrap;margin-bottom:1rem"><input id="q" placeholder="TÃ¬m tÃªn phim"><select id="g"><option value="">Táº¥t cáº£ thá»ƒ loáº¡i</option>${genres.map((g) => `<option>${g}</option>`).join("")}</select></div><div id="mv"></div></div>`;
+  const go = () => {
+    const q = $("#q").value.toLowerCase(),
+      g = $("#g").value;
+    mountMovies(
+      $("#mv"),
+      ms.filter(
+        (m) => m.title.toLowerCase().includes(q) && (!g || m.genre === g),
+      ),
+      $("#mv").dataset.tab || qs.get("tab"),
+    );
+  };
+  $("#q").value = qs.get("q") || "";
+  $("#q").oninput = go;
+  $("#g").onchange = go;
+  go();
+}
+
+async function pChiTiet() {
+  const id = qs.get("id");
+  if (!id) {
+    location.href = "phim.html";
+    return;
+  }
+  const [ms, ss, rv] = await Promise.all([
+      API.movies(),
+      API.showtimes(id),
+      API.reviews(id),
+    ]),
+    m = ms.find((x) => x.movie_id == id);
+  if (!m) {
+    location.href = "phim.html";
+    return;
+  }
+  const d =
+      typeof m.metadata === "string"
+        ? JSON.parse(m.metadata || "{}")
+        : m.metadata || {},
+    th = {};
+  ss.forEach((s) =>
+    ((th[s.theater_name || "Ráº¡p"] ||= {})[fDate(s.start_time)] ||= []).push(s),
+  );
+  app.innerHTML = `<section class="mhero" style="--h:${(m.movie_id * 67) % 360}"><div class="wrap row2">${poster(m)}<div><span class="chip2">${m.status === "SOON" ? "Sáº¯p chiáº¿u" : "Äang chiáº¿u"}</span><h1>${m.title}</h1><p class="meta">${m.genre} Â· ${m.duration_min} phÃºt Â· ${m.rating}${m.review_count ? " Â· â˜… " + Number(m.avg_rating || 0).toFixed(1) + " (" + m.review_count + " Ä‘Ã¡nh giÃ¡)" : ""}</p><p><b>Äáº¡o diá»…n:</b> ${d.director || "Äang cáº­p nháº­t"}<br><b>Diá»…n viÃªn:</b> ${(Array.isArray(d.cast) ? d.cast.join(", ") : d.cast) || "Äang cáº­p nháº­t"}<br><b>NgÃ´n ngá»¯:</b> ${d.language || "Äang cáº­p nháº­t"}</p>${d.trailer ? `<div style="display:flex;justify-content:center;margin-top:.8rem"><a class="btn ghost" href="${d.trailer}" target="_blank" rel="noopener" style="position:static;margin:0;transform:none">Xem trailer</a></div>` : ""}</div></div></section>
+  <div class="wrap"><h2 class="t">Lá»‹ch chiáº¿u</h2>${
+    Object.keys(th)
+      .map(
+        (n) =>
+          `<h3>${n}</h3>${Object.keys(th[n])
+            .map(
+              (k) =>
+                `<div class="day"><b>${k}</b><div>${th[n][k].map((s) => `<a class="chip" href="dat-ve.html?st=${s.showtime_id}">${fTime(s.start_time)}<small>${s.room_name}, ${money(s.base_price)}</small></a>`).join("")}</div></div>`,
+            )
+            .join("")}`,
+      )
+      .join("") ||
+    '<p class="muted">Phim chÆ°a cÃ³ lá»‹ch chiáº¿u. HÃ£y quay láº¡i sau.</p>'
+  }
+  <h2 class="t">ÄÃ¡nh giÃ¡</h2><div class="box" style="margin-bottom:1rem">${user ? `<form id="rf"><label class="f">Äiá»ƒm cá»§a báº¡n<br><select name="r"><option value="5">5 sao</option><option value="4">4 sao</option><option value="3">3 sao</option><option value="2">2 sao</option><option value="1">1 sao</option></select></label><label class="f">Nháº­n xÃ©t<br><textarea name="t" rows="3" maxlength="500" required></textarea></label><button class="btn">Gá»­i Ä‘Ã¡nh giÃ¡</button></form>` : `<a class="btn" href="dang-nhap.html?next=${encodeURIComponent("chi-tiet.html?id=" + id)}">ÄÄƒng nháº­p Ä‘á»ƒ Ä‘Ã¡nh giÃ¡</a>`}</div>
+  ${rv.map((r) => `<div class="rev"><b>${esc(r.name)}</b> <span class="stars">${"â˜…".repeat(r.rating)}${"â˜†".repeat(5 - r.rating)}</span> <span class="muted small">${fDate(r.at)}</span><p>${esc(r.text)}</p></div>`).join("") || '<p class="muted">ChÆ°a cÃ³ Ä‘Ã¡nh giÃ¡ nÃ o.</p>'}</div>`;
+  const rf = $("#rf");
+  if (rf)
+    rf.onsubmit = async (ev) => {
+      ev.preventDefault();
+      const f = new FormData(rf);
+      try {
+        await API.addReview(user.id, id, +f.get("r"), f.get("t"));
+        toast("Cáº£m Æ¡n báº¡n Ä‘Ã£ Ä‘Ã¡nh giÃ¡");
+        pChiTiet();
+      } catch (e) {
+        showErr(e);
+      }
+    };
+}
+
+async function pDatVe() {
+  const id = qs.get("st");
+  if (!id) {
+    location.href = "phim.html";
+    return;
+  }
+  if (!user) {
+    toast("HÃ£y Ä‘Äƒng nháº­p tÃ i khoáº£n trÆ°á»›c khi Ä‘áº·t vÃ©", true);
+    setTimeout(
+      () =>
+        (location.href =
+          "dang-nhap.html?next=" + encodeURIComponent("dat-ve.html?st=" + id)),
+      900,
+    );
+    return;
+  }
+  const [st, ms, combos] = await Promise.all([
+      API.showtime(id),
+      API.movies(),
+      API.combos(),
+    ]),
+    mv = ms.find((x) => x.movie_id == st.movie_id) || {
+      movie_id: 0,
+      title: st.title,
+      rating: "",
+    };
+  let seats = await API.seatmap(id),
+    sel = new Set(),
+    hold = null;
+  if (qs.get("resume")) {
+    try {
+      const r = await API.resume(+qs.get("resume"), user.id);
+      hold = { id: r.booking_id, exp: toDate(r.expires_at).getTime() };
+      (r.seat_ids || []).forEach((i) => sel.add(Number(i)));
+    } catch (e) {
+      showErr(e);
+    }
+  }
+  const cmb = {},
+    comboTot = () =>
+      combos.reduce((a, c) => a + c.price * (cmb[c.combo_id] || 0), 0);
+  const info = (i) => seats.find((x) => x.seat_id === i),
+    label = (i) => info(i).row_label + info(i).seat_no;
+  const reload = async () => {
+    seats = await API.seatmap(id);
+    draw();
+  };
+  const tick = () => {
+    clearInterval(timer);
+    timer = setInterval(async () => {
+      const s = Math.max(0, Math.round((hold.exp - Date.now()) / 1000)),
+        c = $("#cd");
+      if (c)
+        c.textContent =
+          Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+      if (!s) {
+        clearInterval(timer);
+        hold = null;
+        sel.clear();
+        toast("Háº¿t 10 phÃºt, gháº¿ Ä‘Ã£ Ä‘Æ°á»£c tráº£ láº¡i", true);
+        await reload();
+      }
+    }, 1000);
+  };
+  function draw() {
+    const rows = [...new Set(seats.map((s) => s.row_label))],
+      est = [...sel].reduce((a, i) => a + (info(i)?.price || 0), 0);
+    app.innerHTML = `<div class="wrap"><div class="steps"><span class="${hold ? "" : "on"}">1. Chá»n gháº¿</span><span class="${hold ? "on" : ""}">2. Thanh toÃ¡n</span><span>3. Nháº­n vÃ©</span></div><div class="book"><div class="box"><div class="screen">MÃ n hÃ¬nh</div>
+    ${rows
+      .map(
+        (r) =>
+          `<div class="srow"><b>${r}</b>${seats
+            .filter((s) => s.row_label === r)
+            .map(
+              (s) =>
+                `<button class="seat ${s.seat_type} ${s.status} ${sel.has(s.seat_id) ? "sel" : ""}" data-id="${s.seat_id}" ${s.status !== "AVAILABLE" || hold ? "disabled" : ""} title="${label(s.seat_id)}, ${s.seat_type}${s.price ? ", " + money(s.price) : ""}">${s.seat_no}</button>`,
+            )
+            .join("")}</div>`,
+      )
+      .join("")}
+    <div class="legend"><span><i style="background:var(--s1)"></i>ThÆ°á»ng</span><span><i style="background:var(--s2)"></i>VIP</span><span><i style="background:var(--s3)"></i>Gháº¿ Ä‘Ã´i</span><span><i style="background:var(--red)"></i>Äang chá»n</span><span><i style="background:var(--s4)"></i>ÄÃ£ cÃ³ ngÆ°á»i</span></div></div>
+    <aside class="box"><div class="sum">${poster(mv)}<div><h3>${mv.title}</h3><div class="muted">${fDate(st.start_time)} ${fTime(st.start_time)}<br>${st.theater_name || ""}, ${st.room_name || ""}</div></div></div>
+    <p>Gháº¿: <b>${[...sel].map(label).join(", ") || "chÆ°a chá»n"}</b></p><div class="tot"><span>Táº¡m tÃ­nh</span><span id="tot">${est ? money(est + comboTot()) : "â€”"}</span></div><br>
+    ${
+      hold
+        ? `<p>ÄÆ¡n #${hold.id}, cÃ²n <b id="cd"></b> Ä‘á»ƒ thanh toÃ¡n</p><h4 style="margin:.4rem 0">Báº¯p nÆ°á»›c</h4>${combos.map((c) => `<label style="display:flex;justify-content:space-between;gap:.5rem;margin:.3rem 0"><span>${c.name}<br><small class="muted">${c.desc}, ${money(c.price)}</small></span><input type="number" min="0" max="10" value="${cmb[c.combo_id] || 0}" data-cb="${c.combo_id}" style="width:64px;min-width:0"></label>`).join("")}<div class="pay"><input id="promo" placeholder="MÃ£ khuyáº¿n mÃ£i" style="min-width:0;width:100%;margin-bottom:.5rem"><label><input type="radio" name="m" value="MOMO" checked>VÃ­ MoMo</label><label><input type="radio" name="m" value="ZALOPAY">ZaloPay</label><label><input type="radio" name="m" value="CARD">Tháº» ATM / Visa</label></div><br><button class="btn" id="pay">Thanh toÃ¡n</button> <button class="btn alt" id="cancel">Huá»· Ä‘Æ¡n</button>`
+        : `<button class="btn" id="hold" ${sel.size ? "" : "disabled"}>Giá»¯ gháº¿ 10 phÃºt</button><p class="muted small">Chá»n tá»‘i Ä‘a 8 gháº¿ má»—i Ä‘Æ¡n.</p>`
+    }</aside></div></div>`;
+    app.querySelectorAll(".seat").forEach(
+      (b) =>
+        (b.onclick = () => {
+          const i = +b.dataset.id;
+          if (sel.has(i)) sel.delete(i);
+          else if (sel.size < 8) sel.add(i);
+          else toast("Tá»‘i Ä‘a 8 gháº¿ má»—i Ä‘Æ¡n", true);
+          draw();
+        }),
+    );
+    app.querySelectorAll("[data-cb]").forEach(
+      (i) =>
+        (i.oninput = () => {
+          cmb[i.dataset.cb] = Math.max(0, Math.min(10, +i.value || 0));
+          $("#tot").textContent = money(est + comboTot());
+        }),
+    );
+    on("#hold", async () => {
+      try {
+        const r = await API.hold(user.id, +id, [...sel]);
+        hold = {
+          id: r.booking_id,
+          exp: r.expires_at
+            ? toDate(r.expires_at).getTime()
+            : Date.now() + 600000,
+        };
+        toast("ÄÃ£ giá»¯ gháº¿, hÃ£y thanh toÃ¡n trong 10 phÃºt");
+        draw();
+        tick();
+      } catch (e) {
+        showErr(e);
+        sel.clear();
+        await reload();
+      }
+    });
+    on("#pay", async () => {
+      try {
+        const r = await API.confirm(
+          hold.id,
+          $("#promo").value.trim() || null,
+          document.querySelector("[name=m]:checked").value,
+          cmb,
+        );
+        clearInterval(timer);
+        sessionStorage.setItem(
+          "ticket",
+          JSON.stringify({
+            ...r,
+            booking_id: hold.id,
+            title: mv.title,
+            when: fDate(st.start_time) + " " + fTime(st.start_time),
+            room: (st.theater_name || "") + ", " + st.room_name,
+          }),
+        );
+        location.href = "ve.html";
+      } catch (e) {
+        showErr(e);
+      }
+    });
+    on("#cancel", async () => {
+      try {
+        await API.cancel(hold.id, user.id);
+        clearInterval(timer);
+        hold = null;
+        sel.clear();
+        toast("ÄÃ£ huá»· Ä‘Æ¡n");
+        await reload();
+      } catch (e) {
+        showErr(e);
+      }
+    });
+  }
+  draw();
+  if (hold) tick();
+}
+
+async function pVe() {
+  const t = JSON.parse(sessionStorage.getItem("ticket") || "null");
+  if (!t) {
+    app.innerHTML =
+      '<div class="wrap"><h1 class="t">VÃ© cá»§a báº¡n</h1><p style="text-align:center" class="muted">Báº¡n chÆ°a cÃ³ vÃ© nÃ o. <a href="phim.html" style="color:var(--red)">Chá»n phim ngay</a></p></div>';
+    return;
+  }
+  app.innerHTML = `<div class="wrap"><div class="steps"><span>1. Chá»n gháº¿</span><span>2. Thanh toÃ¡n</span><span class="on">3. Nháº­n vÃ©</span></div><div class="stub"><div class="main"><h2 style="margin:0;color:var(--red)">${t.title || "VÃ© xem phim"}</h2><p class="muted">${t.when || ""}, ${t.room || ""}</p><p>Gháº¿: <b>${(t.tickets || []).map((x) => x.seat_label).join(", ") || t.seatsText || "â€”"}</b></p><p>${(t.combos || []).map((c) => c.qty + " x " + c.name).join(", ")}</p><p class="muted">Tiá»n vÃ© ${money(t.subtotal)}, giáº£m ${money(t.discount_amount)}</p><h3 style="margin:0">ÄÃ£ thanh toÃ¡n ${money(t.final_amount)}</h3><div class="bar"></div></div><div class="tear"><p class="muted">MÃ£ Ä‘Æ¡n</p><h2 style="margin:0">#${t.booking_id}</h2><div id="qr" style="display:inline-block;background:#fff;padding:6px;border-radius:8px;margin:.6rem 0"></div><p class="muted">Tráº¡ng thÃ¡i</p><b id="st">PAID</b></div></div>
+  <p style="text-align:center"><button class="btn alt" onclick="print()">In vÃ©</button> <button class="btn alt" id="refund">Huá»· vÃ© vÃ  hoÃ n tiá»n</button> <a class="btn" href="index.html">Vá» trang chá»§</a></p></div>`;
+  if (window.QRCode)
+    new QRCode($("#qr"), {
+      text:
+        "CINEDB-" +
+        t.booking_id +
+        "-" +
+        ((t.tickets || []).map((x) => x.seat_label).join(".") ||
+          t.seatsText ||
+          ""),
+      width: 104,
+      height: 104,
+    });
+  else $("#qr").remove();
+  on("#refund", async () => {
+    if (!user) {
+      location.href = "dang-nhap.html";
+      return;
+    }
+    try {
+      await API.cancel(t.booking_id, user.id);
+      $("#st").textContent = "CANCELLED";
+      sessionStorage.removeItem("ticket");
+      toast("ÄÃ£ hoÃ n tiá»n 100%");
+    } catch (e) {
+      showErr(e);
+    }
+  });
+}
+
+async function pThanhVien() {
+  if (user) {
+    location.href = "ho-so.html";
+    return;
+  }
+  const inp = (n, l, t = "text") =>
+    `<label class="f">${l}<input name="${n}" type="${t}" required></label>`;
+  app.innerHTML = `<div class="wrap"><h1 class="t">ÄÄƒng kÃ½ thÃ nh viÃªn</h1><form id="f" class="box" style="max-width:480px">${inp("n", "Há» tÃªn")}${inp("e", "Email", "email")}${pwField("p", "Máº­t kháº©u")}${pwField("c", "XÃ¡c nháº­n máº­t kháº©u")}<p class="muted small">Tá»‘i thiá»ƒu 8 kÃ½ tá»±, cÃ³ chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  chá»¯ sá»‘.</p><button class="btn">ÄÄƒng kÃ½</button> <a href="dang-nhap.html">ÄÃ£ cÃ³ tÃ i khoáº£n? ÄÄƒng nháº­p</a></form></div>`;
+  $("#f").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    if (f.get("p") !== f.get("c")) {
+      toast("Máº­t kháº©u xÃ¡c nháº­n khÃ´ng khá»›p", true);
+      return;
+    }
+    try {
+      const r = await API.register(f.get("n").trim(), f.get("e"), f.get("p"));
+      localStorage.setItem(
+        "cinema_user",
+        JSON.stringify({
+          id: r.customer_id,
+          name: f.get("n").trim(),
+          email: f.get("e"),
+          role: "CUSTOMER",
+        }),
+      );
+      location.href = qs.get("next") || "index.html";
+    } catch (e) {
+      showErr(e);
+    }
+  };
+}
+
+async function pHoSo() {
+  if (!user) {
+    location.href = "dang-nhap.html?next=ho-so.html";
+    return;
+  }
+  const p = await API.getProfile(user.id),
+    today = new Date().toISOString().slice(0, 10),
+    v = (x) => esc(x || "");
+  app.innerHTML = `<div class="wrap"><h1 class="t">Há»“ sÆ¡ cÃ¡ nhÃ¢n</h1><div class="prof"><aside class="box ctr"><div class="avatar">${esc((p.full_name || "?")[0].toUpperCase())}</div><h3>${v(p.full_name)}</h3><p class="muted small">${v(p.email)}<br>MÃ£ khÃ¡ch hÃ ng ${p.customer_id}${user.role === "ADMIN" ? "<br>Quáº£n trá»‹ viÃªn" : ""}</p><a class="btn alt sm" href="ve-cua-toi.html">VÃ© cá»§a tÃ´i</a> <button class="btn alt sm" id="out">ÄÄƒng xuáº¥t</button></aside>
+  <div><form id="pf" class="box"><h3>ThÃ´ng tin cÃ¡ nhÃ¢n</h3><div class="fgrid"><label class="f">Há» tÃªn<input name="n" value="${v(p.full_name)}" required></label><label class="f">Email<input value="${v(p.email)}" disabled></label><label class="f">Sá»‘ Ä‘iá»‡n thoáº¡i<input name="ph" type="tel" value="${v(p.phone)}" placeholder="0901234567"></label><label class="f">NgÃ y sinh<input name="b" type="date" max="${today}" value="${v(String(p.birth || "").slice(0, 10))}"></label><label class="f">Giá»›i tÃ­nh<select name="g">${["", "Nam", "Ná»¯", "KhÃ¡c"].map((x) => `<option value="${x}" ${p.gender === x ? "selected" : ""}>${x || "KhÃ´ng muá»‘n nÃªu"}</option>`).join("")}</select></label><label class="f">Äá»‹a chá»‰<input name="a" value="${v(p.address)}"></label></div><button class="btn">LÆ°u thay Ä‘á»•i</button></form>
+  <form id="pw" class="box" style="margin-top:1.2rem"><h3>Äá»•i máº­t kháº©u</h3>${pwField("o", "Máº­t kháº©u hiá»‡n táº¡i")}${pwField("p", "Máº­t kháº©u má»›i")}${pwField("c", "XÃ¡c nháº­n máº­t kháº©u má»›i")}<p class="muted small">Tá»‘i thiá»ƒu 8 kÃ½ tá»±, cÃ³ chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  chá»¯ sá»‘.</p><button class="btn">Äá»•i máº­t kháº©u</button></form></div></div></div>`;
+  bindEyes();
+  $("#pf").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target),
+      n = f.get("n").trim();
+    try {
+      await API.updateProfile(user.id, {
+        full_name: n,
+        phone: f.get("ph").trim(),
+        birth: f.get("b"),
+        gender: f.get("g"),
+        address: f.get("a").trim(),
+      });
+      user.name = n;
+      localStorage.setItem("cinema_user", JSON.stringify(user));
+      layout();
+      toast("ÄÃ£ lÆ°u há»“ sÆ¡");
+    } catch (e) {
+      showErr(e);
+    }
+  };
+  $("#pw").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    if (f.get("p") !== f.get("c")) {
+      toast("Máº­t kháº©u xÃ¡c nháº­n khÃ´ng khá»›p", true);
+      return;
+    }
+    try {
+      await API.changePassword(user.id, f.get("o"), f.get("p"));
+      ev.target.reset();
+      toast("ÄÃ£ Ä‘á»•i máº­t kháº©u");
+    } catch (e) {
+      showErr(e);
+    }
+  };
+  on("#out", () => {
+    localStorage.removeItem("cinema_user");
+    location.href = "index.html";
+  });
+}
+
+function pUuDai() {
+  const l = [
+    [
+      "WELCOME10",
+      "Giáº£m 10% má»i Ä‘Æ¡n",
+      "Giáº£m tá»‘i Ä‘a 30.000Ä‘, dÃ¹ng Ä‘Æ°á»£c cho má»i suáº¥t chiáº¿u.",
+    ],
+    ["GIAM50K", "Giáº£m 50.000Ä‘", "Ãp dá»¥ng cho Ä‘Æ¡n tá»« 200.000Ä‘."],
+    [
+      "THU3",
+      "Thá»© Ba Ä‘á»“ng giÃ¡",
+      "Giáº£m 15% (tá»‘i Ä‘a 40.000Ä‘), chá»‰ Ã¡p dá»¥ng cho suáº¥t chiáº¿u thá»© Ba. Äiá»u kiá»‡n nÃ y lÆ°u trong cá»™t JSON PROMOTION.conditions.",
+    ],
+  ];
+  app.innerHTML = `<div class="wrap"><h1 class="t">Tin má»›i vÃ  Æ°u Ä‘Ã£i</h1><div class="grid">${l.map((x) => `<div class="box promo"><h3>${x[1]}</h3><p>${x[2]}</p><p>MÃ£: <code>${x[0]}</code></p></div>`).join("")}<div class="box promo"><h3>Suáº¥t sá»›m giáº£m 20%</h3><p>Suáº¥t chiáº¿u trÆ°á»›c 12 giá» trÆ°a tá»± Ä‘á»™ng giáº£m giÃ¡, khÃ´ng cáº§n nháº­p mÃ£. Cuá»‘i tuáº§n phá»¥ thu 15%.</p></div></div></div>`;
+}
+
+function pDangNhap() {
+  if (user) {
+    location.href = "index.html";
+    return;
+  }
+  app.innerHTML = `<div class="wrap"><h1 class="t">ÄÄƒng nháº­p</h1><form id="f" class="box" style="max-width:480px;margin:auto"><label class="f">Email<br><input name="e" type="email" required style="width:100%"></label>${pwField("p", "Máº­t kháº©u")}<button class="btn">ÄÄƒng nháº­p</button> <a href="thanh-vien.html">ChÆ°a cÃ³ tÃ i khoáº£n? ÄÄƒng kÃ½</a><br><a href="quen-mat-khau.html">QuÃªn máº­t kháº©u?</a></form></div>`;
+  $("#f").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    try {
+      const r = await API.login(f.get("e"), f.get("p"));
+      localStorage.setItem(
+        "cinema_user",
+        JSON.stringify({
+          id: r.customer_id,
+          name: r.full_name,
+          email: f.get("e"),
+          role: r.role,
+        }),
+      );
+      location.href = qs.get("next") || "index.html";
+    } catch (e) {
+      showErr(e);
+    }
+  };
+}
+
+async function pVeCuaToi() {
+  if (!user) {
+    location.href = "dang-nhap.html?next=ve-cua-toi.html";
+    return;
+  }
+  const bs = await API.myBookings(user.id),
+    vi = {
+      PAID: "ÄÃ£ thanh toÃ¡n",
+      PENDING: "Chá» thanh toÃ¡n",
+      CANCELLED: "ÄÃ£ huá»·",
+      EXPIRED: "Háº¿t háº¡n",
+    };
+  app.innerHTML = `<div class="wrap"><h1 class="t">VÃ© cá»§a tÃ´i</h1><table><tr><th>ÄÆ¡n</th><th>Phim</th><th>Suáº¥t chiáº¿u</th><th>Gháº¿</th><th>Tá»•ng tiá»n</th><th>Tráº¡ng thÃ¡i</th><th></th></tr>${bs.map((b, i) => `<tr><td>#${b.booking_id}</td><td>${b.title}</td><td>${fDate(b.start_time)} ${fTime(b.start_time)}<br><small class="muted">${b.room_name}</small></td><td>${b.seats || "â€”"}</td><td>${b.final_amount ? money(b.final_amount) : "â€”"}</td><td>${vi[b.status] || b.status}</td><td>${b.status === "PAID" ? `<button class="btn sm" data-v="${i}">Xem vÃ©</button> ` : ""}${b.status === "PENDING" && toDate(b.exp).getTime() > Date.now() ? `<a class="btn sm" href="dat-ve.html?st=${b.showtime_id}&resume=${b.booking_id}">Thanh toÃ¡n tiáº¿p</a> ` : ""}${["PENDING", "PAID"].includes(b.status) ? `<button class="btn sm alt" data-c="${b.booking_id}">${b.status === "PAID" ? "Huá»· vÃ  hoÃ n tiá»n" : "Huá»· Ä‘Æ¡n"}</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="7">Báº¡n chÆ°a cÃ³ Ä‘Æ¡n Ä‘áº·t vÃ© nÃ o.</td></tr>'}</table></div>`;
+  app.querySelectorAll("[data-c]").forEach(
+    (b) =>
+      (b.onclick = async () => {
+        try {
+          await API.cancel(+b.dataset.c, user.id);
+          toast("ÄÃ£ huá»· Ä‘Æ¡n");
+          pVeCuaToi();
+        } catch (e) {
+          showErr(e);
+        }
+      }),
+  );
+  app.querySelectorAll("[data-v]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const x = bs[+b.dataset.v];
+        sessionStorage.setItem(
+          "ticket",
+          JSON.stringify({
+            booking_id: x.booking_id,
+            title: x.title,
+            when: fDate(x.start_time) + " " + fTime(x.start_time),
+            room: x.room_name,
+            tickets: x.tickets,
+            seatsText: x.seats,
+            combos: x.combos,
+            subtotal: x.subtotal,
+            discount_amount: x.discount_amount,
+            final_amount: x.final_amount,
+          }),
+        );
+        location.href = "ve.html";
+      }),
+  );
+}
+
+async function pRap() {
+  const [ts, rooms, ss] = await Promise.all([
+    API.theaters(),
+    API.rooms(),
+    API.allShowtimes(),
+  ]);
+  if (!ts.length) {
+    app.innerHTML =
+      '<div class="wrap"><h1 class="t">Ráº¡p chiáº¿u phim</h1><p class="muted">ChÆ°a cÃ³ dá»¯ liá»‡u ráº¡p.</p></div>';
+    return;
+  }
+  const t = ts.find((x) => x.theater_id == qs.get("t")) || ts[0],
+    up = ss
+      .filter(
+        (s) =>
+          toDate(s.start_time).getTime() > Date.now() && s.status === "OPEN",
+      )
+      .sort((a, b) => toDate(a.start_time) - toDate(b.start_time));
+  app.innerHTML = `<div class="wrap"><h1 class="t">Ráº¡p chiáº¿u phim</h1>${[
+    ...new Set(ts.map((x) => x.city)),
+  ]
+    .map(
+      (c) =>
+        `<h3>${c}</h3><div class="tabs" style="justify-content:flex-start">${ts
+          .filter((x) => x.city === c)
+          .map(
+            (x) =>
+              `<button class="${x.theater_id === t.theater_id ? "on" : ""}" onclick="location.href='rap.html?t=${x.theater_id}'">${x.name}</button>`,
+          )
+          .join("")}</div>`,
+    )
+    .join("")}
+  <div class="box"><h3>${t.name}</h3><p class="muted">${t.address}, ${t.city}</p></div>
+  ${rooms
+    .filter((r) => r.theater_id === t.theater_id)
+    .map(
+      (r) =>
+        `<h3>${r.name}: suáº¥t chiáº¿u sáº¯p tá»›i</h3><table><tr><th>Phim</th><th>NgÃ y giá»</th><th>GiÃ¡ cÆ¡ sá»Ÿ</th><th>ÄÃ£ bÃ¡n</th><th></th></tr>${
+          up
+            .filter((s) => s.room_id === r.room_id)
+            .map(
+              (s) =>
+                `<tr><td>${s.title}</td><td>${fDate(s.start_time)} ${fTime(s.start_time)}</td><td>${money(s.base_price)}</td><td>${s.occupancy}%</td><td><a class="btn" href="dat-ve.html?st=${s.showtime_id}">Mua vÃ©</a></td></tr>`,
+            )
+            .join("") || '<tr><td colspan="5">ChÆ°a cÃ³ suáº¥t chiáº¿u.</td></tr>'
+        }</table>`,
+    )
+    .join("")}</div>`;
+}
+
+function pTinTuc() {
+  const a = NEWS.find((x) => x.id == qs.get("id"));
+  app.innerHTML = a
+    ? `<div class="wrap" style="max-width:720px"><a href="tin-tuc.html" style="color:var(--red)">Quay láº¡i tin tá»©c</a><h1>${a.title}</h1><p class="muted">${a.date}</p><p>${a.body}</p></div>`
+    : `<div class="wrap"><h1 class="t">Tin tá»©c</h1><div class="grid">${NEWS.map((x) => `<a class="box" href="tin-tuc.html?id=${x.id}"><h3>${x.title}</h3><p class="muted small">${x.date}</p><p>${x.body.slice(0, 90)}â€¦</p></a>`).join("")}</div></div>`;
+}
+
+// ----- Quáº£n trá»‹ (chá»‰ vai trÃ² ADMIN) -----
+const act = async (fn, ok, again) => {
+  try {
+    await fn();
+    toast(ok);
+    again();
+  } catch (e) {
+    showErr(e);
+  }
+};
+const fld = (n, l, x = "") => `<label>${l}<br><input name="${n}" ${x}></label>`;
+const FORM =
+  'class="box" style="display:flex;gap:.8rem;flex-wrap:wrap;align-items:end"';
+
+async function pQuanTri() {
+  if (user?.role !== "ADMIN") {
+    app.innerHTML =
+      '<div class="wrap" style="text-align:center"><h1 class="t">Quáº£n trá»‹</h1><p>Chá»‰ quáº£n trá»‹ viÃªn má»›i xem Ä‘Æ°á»£c trang nÃ y. <a href="quan-tri-dang-nhap.html" style="color:var(--red)">ÄÄƒng nháº­p</a></p><p class="muted small">TÃ i khoáº£n: admin@cinedb.vn / Admin123</p></div>';
+    return;
+  }
+  const tab = qs.get("tab") || "doanhthu",
+    tabs = [
+      ["doanhthu", "Doanh thu"],
+      ["phim", "Phim"],
+      ["suat", "Suáº¥t chiáº¿u"],
+      ["khuyenmai", "Khuyáº¿n mÃ£i"],
+      ["combo", "Combo"],
+      ["khach", "KhÃ¡ch hÃ ng"],
+    ];
+  app.innerHTML = `<div class="wrap"><h1 class="t">Quáº£n trá»‹</h1><div class="tabs" style="flex-wrap:wrap">${tabs.map(([k, v]) => `<button class="${k === tab ? "on" : ""}" onclick="location.href='quan-tri.html?tab=${k}'">${v}</button>`).join("")}</div><div id="ad"></div></div>`;
+  await (
+    {
+      doanhthu: aRev,
+      phim: aMovies,
+      suat: aShow,
+      khuyenmai: aPromo,
+      combo: aCombo,
+      khach: aCust,
+    }[tab] || aRev
+  )($("#ad"));
+}
+
+async function aRev(box) {
+  const [rev, log] = await Promise.all([API.revenue(), API.audit()]),
+    tot = rev.reduce((a, r) => a + Number(r.gross_revenue), 0),
+    days = {};
+  rev.forEach((r) => (days[r.show_date] ||= []).push(r));
+  const rows = Object.keys(days)
+    .sort()
+    .flatMap((d) =>
+      days[d]
+        .sort((a, b) => b.gross_revenue - a.gross_revenue)
+        .map((r, i) => ({ ...r, rnk: i + 1 })),
+    );
+  box.innerHTML = `<div class="stats"><div><b>${money(tot)}</b><span>Doanh thu gá»™p</span></div><div><b>${rev.reduce((a, r) => a + Number(r.tickets_sold), 0)}</b><span>VÃ© Ä‘Ã£ bÃ¡n</span></div><div><b>${log.filter((l) => l.new_value === "PAID").length}</b><span>ÄÆ¡n Ä‘Ã£ thanh toÃ¡n</span></div><div><b>${log.filter((l) => ["CANCELLED", "EXPIRED"].includes(l.new_value)).length}</b><span>ÄÆ¡n huá»· hoáº·c háº¿t háº¡n</span></div></div><p><button class="btn alt" id="csv">Xuáº¥t CSV</button> <button class="btn" id="rel">Cháº¡y sp_release_expired_holds</button> <button class="btn alt" id="rst">Äáº·t láº¡i phiÃªn</button></p>
+  <h3>Doanh thu vÃ  háº¡ng phim theo ngÃ y chiáº¿u</h3><table><tr><th>NgÃ y chiáº¿u</th><th>Háº¡ng</th><th>Phim</th><th>Sá»‘ vÃ©</th><th>Doanh thu gá»™p</th></tr>${rows.map((r) => `<tr><td>${toDate(r.show_date).toLocaleDateString("vi-VN")}</td><td>${r.rnk}</td><td>${r.title}</td><td>${r.tickets_sold}</td><td>${money(r.gross_revenue)}</td></tr>`).join("") || '<tr><td colspan="5">ChÆ°a cÃ³ vÃ© nÃ o Ä‘Æ°á»£c bÃ¡n.</td></tr>'}<tr><td colspan="4"><b>Tá»•ng cá»™ng</b></td><td><b>${money(tot)}</b></td></tr></table>
+  <h3>Nháº­t kÃ½ Ä‘á»•i tráº¡ng thÃ¡i Ä‘Æ¡n</h3><table><tr><th>ÄÆ¡n</th><th>Tá»«</th><th>Sang</th><th>LÃºc</th></tr>${log.map((l) => `<tr><td>#${l.record_id}</td><td>${l.old_value}</td><td>${l.new_value}</td><td>${fDate(l.changed_at)} ${fTime(l.changed_at)}</td></tr>`).join("") || '<tr><td colspan="4">ChÆ°a cÃ³ thay Ä‘á»•i nÃ o.</td></tr>'}</table>`;
+  on("#csv", () => {
+    const csv =
+      "\ufeffNgÃ y chiáº¿u,Háº¡ng,Phim,Sá»‘ vÃ©,Doanh thu gá»™p\n" +
+      rows
+        .map((r) =>
+          [
+            toDate(r.show_date).toLocaleDateString("vi-VN"),
+            r.rnk,
+            '"' + r.title + '"',
+            r.tickets_sold,
+            r.gross_revenue,
+          ].join(","),
+        )
+        .join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(
+      new Blob([csv], { type: "text/csv;charset=utf-8" }),
+    );
+    a.download = "doanh-thu.csv";
+    a.click();
+  });
+  on("#rel", async () => {
+    await API.release();
+    toast("ÄÃ£ giáº£i phÃ³ng gháº¿ quÃ¡ háº¡n");
+    aRev(box);
+  });
+  on("#rst", () => {
+    API.reset();
+    location.href = "index.html";
+  });
+}
+
+async function aMovies(box) {
+  const ms = await API.movies(),
+    again = () => aMovies(box);
+  box.innerHTML = `<h3>ThÃªm phim</h3><form id="f" ${FORM}>${fld("title", "TÃªn phim", "required")}${fld("genre", "Thá»ƒ loáº¡i", "required")}${fld("dur", "Thá»i lÆ°á»£ng (phÃºt)", 'type="number" min="30" value="100" required')}<label>Giá»›i háº¡n tuá»•i<br><select name="rating"><option>P</option><option>T13</option><option>T16</option><option>T18</option></select></label><label>Tráº¡ng thÃ¡i<br><select name="status"><option value="NOW">Äang chiáº¿u</option><option value="SOON">Sáº¯p chiáº¿u</option></select></label>${fld("director", "Äáº¡o diá»…n")}${fld("cast", "Diá»…n viÃªn (cÃ¡ch nhau dáº¥u pháº©y)")}${fld("lang", "NgÃ´n ngá»¯")}${fld("trailer", "Link trailer", 'type="url"')}<label>áº¢nh poster<br><input type="file" name="poster" id="p-file" accept="image/*"></label><img id="p-prev" alt="" style="display:none;width:44px;height:62px;object-fit:cover;border-radius:6px;border:1px solid #ddd"><button class="btn">ThÃªm phim</button></form>
+  <h3>Danh sÃ¡ch phim</h3><table><tr><th>Phim</th><th>Thá»ƒ loáº¡i</th><th>PhÃºt</th><th>Tuá»•i</th><th>Tráº¡ng thÃ¡i</th><th></th></tr>${ms
+    .map((m) => {
+      const meta =
+        typeof m.metadata === "string"
+          ? JSON.parse(m.metadata || "{}")
+          : m.metadata || {};
+      return `<tr><td style="display:flex;align-items:center;gap:.6rem">${meta.poster ? `<img src="${esc(meta.poster)}" style="width:36px;height:50px;object-fit:cover;border-radius:4px">` : ""}<span>${m.title}</span></td><td>${m.genre}</td><td>${m.duration_min}</td><td>${m.rating}</td><td>${m.status === "NOW" ? "Äang chiáº¿u" : "Sáº¯p chiáº¿u"}</td><td><button class="btn alt" data-p="${m.movie_id}">Äá»•i poster</button> <button class="btn alt" data-s="${m.movie_id}">Äá»•i tráº¡ng thÃ¡i</button> <button class="btn alt" data-e="${m.movie_id}">Sá»­a</button> <button class="btn alt" data-d="${m.movie_id}">XoÃ¡</button></td></tr>`;
+    })
+    .join("")}</table>`;
+
+  $("#p-file").onchange = (e) => {
+    const file = e.target.files[0],
+      prev = $("#p-prev");
+    if (file) {
+      prev.src = URL.createObjectURL(file);
+      prev.style.display = "block";
+    } else {
+      prev.style.display = "none";
+    }
+  };
+
+  $("#f").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target),
+      btn = ev.target.querySelector("button"),
+      file = f.get("poster"),
+      oldTxt = btn.textContent;
+    btn.disabled = true;
+    try {
+      let posterUrl = "";
+      if (file && file.size > 0) {
+        btn.textContent = "Äang táº£i áº£nh...";
+        posterUrl = await uploadImgBB(file);
+      }
+      btn.textContent = "Äang lÆ°u phim...";
+      await API.saveMovie({
+        title: f.get("title"),
+        genre: f.get("genre"),
+        duration_min: +f.get("dur"),
+        rating: f.get("rating"),
+        status: f.get("status"),
+        metadata: {
+          director: f.get("director"),
+          cast: f
+            .get("cast")
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean),
+          language: f.get("lang"),
+          trailer: f.get("trailer"),
+          ...(posterUrl ? { poster: posterUrl } : {}),
+        },
+      });
+      toast("ÄÃ£ thÃªm phim");
+      again();
+    } catch (e) {
+      showErr(e);
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  };
+
+  box.querySelectorAll("[data-p]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const inp = document.createElement("input");
+        inp.type = "file";
+        inp.accept = "image/*";
+        inp.onchange = async () => {
+          const file = inp.files[0];
+          if (!file) return;
+          const m = ms.find((x) => x.movie_id == b.dataset.p),
+            oldTxt = b.textContent;
+          b.disabled = true;
+          b.textContent = "Äang táº£i...";
+          try {
+            const url = await uploadImgBB(file),
+              meta =
+                typeof m.metadata === "string"
+                  ? JSON.parse(m.metadata || "{}")
+                  : m.metadata || {};
+            await API.saveMovie({
+              ...m,
+              metadata: { ...meta, poster: url },
+            });
+            toast("ÄÃ£ cáº­p nháº­t poster");
+            again();
+          } catch (e) {
+            showErr(e);
+            b.disabled = false;
+            b.textContent = oldTxt;
+          }
+        };
+        inp.click();
+      }),
+  );
+
+  box.querySelectorAll("[data-s]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const m = ms.find((x) => x.movie_id == b.dataset.s);
+        act(
+          () =>
+            API.saveMovie({
+              ...m,
+              status: m.status === "NOW" ? "SOON" : "NOW",
+            }),
+          "ÄÃ£ Ä‘á»•i tráº¡ng thÃ¡i",
+          again,
+        );
+      }),
+  );
+
+  box.querySelectorAll("[data-e]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const m = ms.find((x) => x.movie_id == b.dataset.e),
+          t = window.prompt("TÃªn phim", m.title),
+          g = t && window.prompt("Thá»ƒ loáº¡i", m.genre),
+          d = g && window.prompt("Thá»i lÆ°á»£ng (phÃºt)", m.duration_min);
+        if (d)
+          act(
+            () =>
+              API.saveMovie({
+                ...m,
+                title: t,
+                genre: g,
+                duration_min: +d || m.duration_min,
+              }),
+            "ÄÃ£ cáº­p nháº­t phim",
+            again,
+          );
+      }),
+  );
+
+  box
+    .querySelectorAll("[data-d]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          window.confirm("XoÃ¡ phim nÃ y?") &&
+          act(() => API.deleteMovie(b.dataset.d), "ÄÃ£ xoÃ¡ phim", again)),
+    );
+}
+
+async function aShow(box) {
+  const [ss, ms, rooms] = await Promise.all([
+      API.allShowtimes(),
+      API.movies(),
+      API.rooms(),
+    ]),
+    again = () => aShow(box);
+  box.innerHTML = `<h3>ThÃªm suáº¥t chiáº¿u</h3><form id="f" ${FORM}><label>Phim<br><select name="m">${ms
+    .filter((m) => m.status === "NOW")
+    .map((m) => `<option value="${m.movie_id}">${m.title}</option>`)
+    .join(
+      "",
+    )}</select></label><label>PhÃ²ng<br><select name="r">${rooms.map((r) => `<option value="${r.room_id}">${r.theater_name}, ${r.name}</option>`).join("")}</select></label><label>Giá» báº¯t Ä‘áº§u<br><input type="datetime-local" name="t" required></label>${fld("p", "GiÃ¡ cÆ¡ sá»Ÿ", 'type="number" value="90000" min="0" step="1000"')}<button class="btn">ThÃªm suáº¥t chiáº¿u</button></form>
+  <h3>Suáº¥t chiáº¿u vÃ  tá»‰ lá»‡ láº¥p Ä‘áº§y</h3><table><tr><th>Phim</th><th>Ráº¡p, phÃ²ng</th><th>Giá» chiáº¿u</th><th>GiÃ¡</th><th>Láº¥p Ä‘áº§y</th><th>Tráº¡ng thÃ¡i</th><th></th></tr>${ss
+    .sort((a, b) => toDate(a.start_time) - toDate(b.start_time))
+    .map(
+      (s) =>
+        `<tr><td>${s.title}</td><td>${s.theater_name}, ${s.room_name}</td><td>${fDate(s.start_time)} ${fTime(s.start_time)}</td><td>${money(s.base_price)}</td><td>${s.occupancy}%</td><td>${s.status === "OPEN" ? "Má»Ÿ bÃ¡n" : "ÄÃ£ huá»·"}</td><td>${s.status === "OPEN" ? `<button class="btn alt" data-c="${s.showtime_id}">Huá»· suáº¥t</button>` : ""}</td></tr>`,
+    )
+    .join("")}</table>`;
+  $("#f").onsubmit = (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    act(
+      () =>
+        API.addShowtime(
+          f.get("m"),
+          f.get("r"),
+          new Date(f.get("t")).getTime(),
+          f.get("p"),
+        ),
+      "ÄÃ£ thÃªm suáº¥t chiáº¿u, gháº¿ Ä‘Æ°á»£c táº¡o tá»± Ä‘á»™ng",
+      again,
+    );
+  };
+  box
+    .querySelectorAll("[data-c]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          window.confirm("Huá»· suáº¥t chiáº¿u nÃ y?") &&
+          act(
+            () => API.cancelShowtime(b.dataset.c),
+            "ÄÃ£ huá»· suáº¥t chiáº¿u",
+            again,
+          )),
+    );
+}
+
+async function aPromo(box) {
+  const ps = await API.promos(),
+    again = () => aPromo(box);
+  box.innerHTML = `<h3>ThÃªm mÃ£ khuyáº¿n mÃ£i</h3><form id="f" ${FORM}>${fld("code", "MÃ£", "required")}<label>Loáº¡i<br><select name="type"><option value="PERCENT">Giáº£m theo %</option><option value="FIXED">Giáº£m sá»‘ tiá»n</option></select></label>${fld("value", "GiÃ¡ trá»‹", 'type="number" min="1" required')}${fld("max", "Giáº£m tá»‘i Ä‘a (Ä‘)", 'type="number" min="0"')}${fld("min", "ÄÆ¡n tá»‘i thiá»ƒu (Ä‘)", 'type="number" min="0" value="0"')}${fld("uses", "Sá»‘ lÆ°á»£t tá»‘i Ä‘a", 'type="number" min="1"')}${fld("days", "NgÃ y Ã¡p dá»¥ng (MON,TUE,... Ä‘á»ƒ trá»‘ng náº¿u má»i ngÃ y)")}<button class="btn">ThÃªm mÃ£</button></form>
+  <h3>Danh sÃ¡ch mÃ£</h3><table><tr><th>MÃ£</th><th>Loáº¡i</th><th>GiÃ¡ trá»‹</th><th>Tá»‘i Ä‘a</th><th>Tá»‘i thiá»ƒu</th><th>NgÃ y</th><th>ÄÃ£ dÃ¹ng</th><th>Tráº¡ng thÃ¡i</th></tr>${ps.map((p) => `<tr><td><b>${p.code}</b></td><td>${p.type === "PERCENT" ? "%" : "Sá»‘ tiá»n"}</td><td>${p.type === "PERCENT" ? p.value + "%" : money(p.value)}</td><td>${p.max ? money(p.max) : "â€”"}</td><td>${money(p.min)}</td><td>${p.days ? p.days.join(", ") : "Má»i ngÃ y"}</td><td>${p.used}/${p.maxUses ?? "âˆž"}</td><td><button class="btn alt" data-t="${p.code}">${p.active === false ? "Äang táº¯t, báº­t láº¡i" : "Äang báº­t, táº¯t Ä‘i"}</button></td></tr>`).join("")}</table>`;
+  $("#f").onsubmit = (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    act(
+      () =>
+        API.savePromo({
+          code: f.get("code"),
+          type: f.get("type"),
+          value: f.get("value"),
+          max: f.get("max"),
+          min: f.get("min"),
+          maxUses: f.get("uses"),
+          days: f
+            .get("days")
+            .toUpperCase()
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean),
+        }),
+      "ÄÃ£ thÃªm mÃ£ khuyáº¿n mÃ£i",
+      again,
+    );
+  };
+  box
+    .querySelectorAll("[data-t]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          act(() => API.togglePromo(b.dataset.t), "ÄÃ£ cáº­p nháº­t mÃ£", again)),
+    );
+}
+
+async function aCombo(box) {
+  const cs = await API.combos(),
+    again = () => aCombo(box);
+  box.innerHTML = `<h3>ThÃªm combo</h3><form id="f" ${FORM}>${fld("name", "TÃªn combo", "required")}${fld("desc", "MÃ´ táº£", "required")}${fld("price", "GiÃ¡ (Ä‘)", 'type="number" min="0" step="1000" required')}<button class="btn">ThÃªm combo</button></form>
+  <h3>Danh sÃ¡ch combo</h3><table><tr><th>TÃªn</th><th>MÃ´ táº£</th><th>GiÃ¡</th><th></th></tr>${cs.map((c) => `<tr><td>${c.name}</td><td>${c.desc}</td><td>${money(c.price)}</td><td><button class="btn alt" data-d="${c.combo_id}">XoÃ¡</button></td></tr>`).join("")}</table>`;
+  $("#f").onsubmit = (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    act(
+      () =>
+        API.saveCombo({
+          name: f.get("name"),
+          desc: f.get("desc"),
+          price: f.get("price"),
+        }),
+      "ÄÃ£ thÃªm combo",
+      again,
+    );
+  };
+  box
+    .querySelectorAll("[data-d]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          act(() => API.deleteCombo(b.dataset.d), "ÄÃ£ xoÃ¡ combo", again)),
+    );
+}
+
+async function aCust(box) {
+  const cs = await API.customers(),
+    again = () => aCust(box);
+  box.innerHTML = `<h3>KhÃ¡ch hÃ ng</h3><table><tr><th>MÃ£</th><th>Há» tÃªn</th><th>Email</th><th>Vai trÃ²</th><th></th></tr>${cs.map((c) => `<tr><td>${c.customer_id}</td><td>${esc(c.full_name)}</td><td>${esc(c.email)}</td><td>${c.role === "ADMIN" ? "Quáº£n trá»‹ viÃªn" : "KhÃ¡ch hÃ ng"}</td><td>${c.customer_id !== user.id ? `<button class="btn alt sm" data-r="${c.customer_id}">${c.role === "ADMIN" ? "Thu há»“i quyá»n quáº£n trá»‹" : "Cáº¥p quyá»n quáº£n trá»‹"}</button>` : ""}</td></tr>`).join("")}</table>`;
+  box.querySelectorAll("[data-r]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const c = cs.find((x) => x.customer_id == b.dataset.r);
+        act(
+          () =>
+            API.setRole(
+              c.customer_id,
+              c.role === "ADMIN" ? "CUSTOMER" : "ADMIN",
+            ),
+          "ÄÃ£ cáº­p nháº­t quyá»n",
+          again,
+        );
+      }),
+  );
+}
+
+function pQuenMk() {
+  app.innerHTML = `<div class="wrap"><h1 class="t">QuÃªn máº­t kháº©u</h1><form id="f1" class="box" style="max-width:480px"><label class="f">Email Ä‘Ã£ Ä‘Äƒng kÃ½<br><input name="e" type="email" required style="width:100%"></label><button class="btn">Gá»­i mÃ£ OTP</button></form>
+  <form id="f2" class="box" style="max-width:480px;margin-top:1rem" hidden><p id="otp" class="muted small"></p><label class="f">MÃ£ OTP<br><input name="o" required inputmode="numeric" style="width:100%"></label>${pwField("p", "Máº­t kháº©u má»›i")}<button class="btn">Äáº·t láº¡i máº­t kháº©u</button></form></div>`;
+  let email = "";
+  $("#f1").onsubmit = async (ev) => {
+    ev.preventDefault();
+    email = new FormData(ev.target).get("e");
+    try {
+      const r = await API.requestReset(email);
+      $("#f2").hidden = false;
+      $("#otp").textContent =
+        r && r.otp
+          ? "MÃ£ OTP (giáº£ láº­p email, cÃ³ hiá»‡u lá»±c 10 phÃºt): " + r.otp
+          : "MÃ£ OTP Ä‘Ã£ Ä‘Æ°á»£c gá»­i tá»›i email cá»§a báº¡n.";
+    } catch (e) {
+      showErr(e);
+    }
+  };
+  $("#f2").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    try {
+      await API.resetPassword(email, f.get("o"), f.get("p"));
+      toast("ÄÃ£ Ä‘áº·t láº¡i máº­t kháº©u, hÃ£y Ä‘Äƒng nháº­p");
+      setTimeout(() => (location.href = "dang-nhap.html"), 1200);
+    } catch (e) {
+      showErr(e);
+    }
+  };
+}
+
+function pQtDangNhap() {
+  if (user?.role === "ADMIN") {
+    location.href = "quan-tri.html";
+    return;
+  }
+  app.innerHTML = `<div class="wrap"><h1 class="t">ÄÄƒng nháº­p quáº£n trá»‹ viÃªn</h1><form id="f" class="box" style="max-width:480px;margin:auto"><label class="f">Email quáº£n trá»‹<br><input name="e" type="email" required></label>${pwField("p", "Máº­t kháº©u")}<button class="btn">ÄÄƒng nháº­p quáº£n trá»‹</button></form></div>`;
+  $("#f").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    try {
+      const r = await API.login(f.get("e"), f.get("p"));
+      if (r.role !== "ADMIN") {
+        toast("TÃ i khoáº£n nÃ y khÃ´ng cÃ³ quyá»n quáº£n trá»‹", true);
+        return;
+      }
+      localStorage.setItem(
+        "cinema_user",
+        JSON.stringify({
+          id: r.customer_id,
+          name: r.full_name,
+          email: f.get("e"),
+          role: "ADMIN",
+        }),
+      );
+      location.href = qs.get("next") || "quan-tri.html";
+    } catch (e) {
+      showErr(e);
+    }
+  };
+}
+
+const pages = {
+  home: pHome,
+  phim: pPhim,
+  chitiet: pChiTiet,
+  datve: pDatVe,
+  ve: pVe,
+  thanhvien: pThanhVien,
+  uudai: pUuDai,
+  quantri: pQuanTri,
+  dangnhap: pDangNhap,
+  vecuatoi: pVeCuaToi,
+  rap: pRap,
+  tintuc: pTinTuc,
+  quenmk: pQuenMk,
+  hoso: pHoSo,
+  qtdangnhap: pQtDangNhap,
+};
+layout();
+Promise.resolve()
+  .then(pages[document.body.dataset.page])
+  .then(() => bindEyes())
+  .catch(
+    (e) => (app.innerHTML = '<div class="wrap err">' + e.message + "</div>"),
+  );
+
+
+===== C:\Users\Khai\cinema-booking\chi-tiet.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="chitiet"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\dang-nhap.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="dangnhap"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\dat-ve.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="datve"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\ho-so.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="hoso"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\index.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="home"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\ords-api.sql =====
+BEGIN
+  ORDS.ENABLE_SCHEMA(
+    p_enabled             => TRUE,
+    p_schema              => 'CINEMA_SCHEMA',
+    p_url_mapping_type    => 'BASE_PATH',
+    p_url_mapping_pattern => 'cinema',
+    p_auto_rest_auth      => FALSE
+  );
+
+  BEGIN
+    ORDS.DELETE_MODULE(p_module_name => 'cinema_api');
+  EXCEPTION
+    WHEN OTHERS THEN NULL;
+  END;
+
+  ORDS.DEFINE_MODULE(
+    p_module_name    => 'cinema_api',
+    p_base_path      => '/',
+    p_items_per_page => 200,
+    p_status         => 'PUBLISHED',
+    p_comments       => 'CineDB REST API synced with js/api.js'
+  );
+
+  -- 1. PHIM
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'movies');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'movies', p_method => 'GET',
+    p_source_type => 'json/collection',
+    p_source      => q'[
+      SELECT m.movie_id, m.title, m.genre, m.duration_min, m.rating,
+             m.release_date, m.metadata, m.status,
+             NVL((SELECT ROUND(AVG(r.rating), 1) FROM review r WHERE r.movie_id = m.movie_id), 0) AS avg_rating,
+             (SELECT COUNT(*) FROM review r WHERE r.movie_id = m.movie_id) AS review_count
+        FROM movie m
+       ORDER BY m.movie_id
+    ]'
+  );
+  BEGIN
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api',
+    p_pattern     => 'movies',
+    p_method      => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE
+        v_raw    CLOB;
+        v_obj    JSON_OBJECT_T;
+        v_elem   JSON_ELEMENT_T;
+        v_id     NUMBER := NULL;
+        v_title  VARCHAR2(200);
+        v_genre  VARCHAR2(100);
+        v_dur    NUMBER;
+        v_rating VARCHAR2(20);
+        v_status VARCHAR2(20) := 'NOW';
+        v_meta   VARCHAR2(32767) := NULL;
+      BEGIN
+        v_raw := :body_text;
+        IF v_raw IS NULL OR DBMS_LOB.GETLENGTH(v_raw) = 0 THEN
+          RAISE_APPLICATION_ERROR(-20050, 'Dá»¯ liá»‡u JSON gá»­i lÃªn bá»‹ rá»—ng');
+        END IF;
+
+        v_obj := JSON_OBJECT_T.parse(v_raw);
+
+        IF v_obj.has('movie_id') AND NOT v_obj.get('movie_id').is_null THEN
+          v_id := TO_NUMBER(TRIM(v_obj.get_String('movie_id')));
+        END IF;
+
+        v_title  := v_obj.get_String('title');
+        v_genre  := v_obj.get_String('genre');
+        v_dur    := TO_NUMBER(TRIM(v_obj.get_String('duration_min')));
+        v_rating := v_obj.get_String('rating');
+
+        IF v_obj.has('status') AND NOT v_obj.get('status').is_null THEN
+          v_status := NVL(TRIM(v_obj.get_String('status')), 'NOW');
+        END IF;
+
+        IF v_obj.has('metadata') AND NOT v_obj.get('metadata').is_null THEN
+          v_elem := v_obj.get('metadata');
+          IF v_elem.is_string THEN
+            v_meta := v_obj.get_String('metadata');
+          ELSE
+            v_meta := v_elem.stringify();
+          END IF;
+        END IF;
+
+        IF v_id IS NOT NULL THEN
+          UPDATE movie
+             SET title        = v_title,
+                 genre        = v_genre,
+                 duration_min = v_dur,
+                 rating       = v_rating,
+                 status       = v_status
+           WHERE movie_id = v_id;
+          IF v_meta IS NOT NULL THEN
+            UPDATE movie SET metadata = v_meta WHERE movie_id = v_id;
+          END IF;
+        ELSE
+          INSERT INTO movie(title, genre, duration_min, rating, release_date, status, metadata)
+          VALUES (v_title, v_genre, v_dur, v_rating, TRUNC(SYSDATE), v_status, v_meta)
+          RETURNING movie_id INTO v_id;
+        END IF;
+
+        COMMIT;
+        :movie_id := v_id;
+      EXCEPTION
+        WHEN OTHERS THEN
+          ROLLBACK;
+          :status_code := 400;
+          :error := SQLERRM;
+      END;
+    ]'
+  );
+  COMMIT;
+END;
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'movies', p_method => 'POST', p_name => 'movie_id', p_bind_variable_name => 'movie_id', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'movies', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'movies/:id');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'movies/:id', p_method => 'DELETE',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE v_cnt NUMBER;
+      BEGIN
+        SELECT COUNT(*) INTO v_cnt FROM showtime WHERE movie_id = :id;
+        IF v_cnt > 0 THEN RAISE_APPLICATION_ERROR(-20052, 'Phim Ä‘Ã£ cÃ³ suáº¥t chiáº¿u, hÃ£y Ä‘á»•i tráº¡ng thÃ¡i thay vÃ¬ xoÃ¡'); END IF;
+        DELETE FROM movie WHERE movie_id = :id;
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'movies/:id', p_method => 'DELETE', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  -- 2. Ráº P, PHÃ’NG, SUáº¤T CHIáº¾U & SÆ  Äá»’ GHáº¾
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'theaters');
+  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'theaters', p_method => 'GET', p_source_type => 'json/collection', p_source => 'SELECT theater_id, name, city, address FROM theater ORDER BY theater_id');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'rooms');
+  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'rooms', p_method => 'GET', p_source_type => 'json/collection', p_source => 'SELECT r.room_id, r.theater_id, t.name AS theater_name, r.name FROM room r JOIN theater t ON t.theater_id = r.theater_id ORDER BY r.room_id');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'showtimes');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'showtimes', p_method => 'GET',
+    p_source_type => 'json/collection',
+    p_source      => q'[
+      SELECT st.showtime_id, st.movie_id, m.title, r.theater_id, t.name AS theater_name,
+             st.room_id, r.name AS room_name,
+             TO_CHAR(st.start_time, 'YYYY-MM-DD"T"HH24:MI:SS') AS start_time,
+             TO_CHAR(st.end_time, 'YYYY-MM-DD"T"HH24:MI:SS') AS end_time,
+             st.base_price, st.status,
+             NVL((SELECT ROUND(100 * SUM(CASE WHEN ss.status = 'SOLD' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))
+                    FROM showtime_seat ss WHERE ss.showtime_id = st.showtime_id), 0) AS occupancy
+        FROM showtime st
+        JOIN movie m ON m.movie_id = st.movie_id
+        JOIN room r ON r.room_id = st.room_id
+        JOIN theater t ON t.theater_id = r.theater_id
+       WHERE (:movie_id IS NULL OR (st.movie_id = :movie_id AND st.start_time > SYSTIMESTAMP AND st.status = 'OPEN'))
+       ORDER BY st.start_time
+    ]'
+  );
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'showtimes/:id');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'showtimes/:id', p_method => 'GET',
+    p_source_type => 'json/item',
+    p_source      => q'[
+      SELECT st.showtime_id, st.movie_id, m.title, r.theater_id, t.name AS theater_name,
+             st.room_id, r.name AS room_name,
+             TO_CHAR(st.start_time, 'YYYY-MM-DD"T"HH24:MI:SS') AS start_time,
+             TO_CHAR(st.end_time, 'YYYY-MM-DD"T"HH24:MI:SS') AS end_time,
+             st.base_price, st.status
+        FROM showtime st
+        JOIN movie m ON m.movie_id = st.movie_id
+        JOIN room r ON r.room_id = st.room_id
+        JOIN theater t ON t.theater_id = r.theater_id
+       WHERE st.showtime_id = :id
+    ]'
+  );
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'showtimes/:id/cancel');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'showtimes/:id/cancel', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE v_cnt NUMBER;
+      BEGIN
+        SELECT COUNT(*) INTO v_cnt FROM showtime_seat WHERE showtime_id = :id AND status IN ('HELD', 'SOLD');
+        IF v_cnt > 0 THEN RAISE_APPLICATION_ERROR(-20051, 'Suáº¥t Ä‘Ã£ cÃ³ ngÆ°á»i giá»¯ hoáº·c mua vÃ©, khÃ´ng thá»ƒ huá»·'); END IF;
+        UPDATE showtime SET status = 'CANCELLED' WHERE showtime_id = :id;
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'showtimes/:id/cancel', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'addshowtime');
+  BEGIN
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api',
+    p_pattern     => 'addshowtime',
+    p_method      => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE
+        v_id    NUMBER;
+        v_dur   NUMBER;
+        v_raw   VARCHAR2(100) := TRIM(:p_start);
+        v_start TIMESTAMP;
+        v_end   TIMESTAMP;
+      BEGIN
+        SELECT duration_min INTO v_dur FROM movie WHERE movie_id = :p_movie_id;
+
+        IF REGEXP_LIKE(v_raw, '^\d+$') THEN
+          v_start := CAST(
+            (TIMESTAMP '1970-01-01 00:00:00 +00:00' + NUMTODSINTERVAL(TO_NUMBER(v_raw) / 1000, 'SECOND'))
+            AT TIME ZONE '+07:00' AS TIMESTAMP
+          );
+        ELSIF INSTR(v_raw, 'Z') > 0 THEN
+          v_start := CAST(
+            TO_TIMESTAMP_TZ(v_raw, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')
+            AT TIME ZONE '+07:00' AS TIMESTAMP
+          );
+        ELSE
+          v_start := TO_TIMESTAMP(REPLACE(SUBSTR(v_raw, 1, 16), 'T', ' '), 'YYYY-MM-DD HH24:MI');
+        END IF;
+
+        v_end := v_start + NUMTODSINTERVAL(v_dur + 15, 'MINUTE');
+        pkg_booking.sp_add_showtime(:p_movie_id, :p_room_id, v_start, v_end, :p_base_price, v_id);
+        :showtime_id := v_id;
+      EXCEPTION
+        WHEN OTHERS THEN
+          ROLLBACK;
+          :status_code := 400;
+          :error := SQLERRM;
+      END;
+    ]'
+  );
+  COMMIT;
+END;
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'addshowtime', p_method => 'POST', p_name => 'showtime_id', p_bind_variable_name => 'showtime_id', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'addshowtime', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'seatmap/:id');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'seatmap/:id', p_method => 'GET',
+    p_source_type => 'json/collection',
+    p_source      => q'[
+      SELECT s.seat_id, s.row_label, s.seat_no, s.seat_type,
+             CASE WHEN ss.status = 'HELD' AND ss.hold_expires_at < SYSTIMESTAMP THEN 'AVAILABLE' ELSE ss.status END AS status,
+             fn_calc_ticket_price(ss.showtime_id, s.seat_id) AS price
+        FROM showtime_seat ss
+        JOIN seat s ON s.seat_id = ss.seat_id
+       WHERE ss.showtime_id = :id
+       ORDER BY s.row_label, s.seat_no
+    ]'
+  );
+
+  -- 3. GIá»® GHáº¾, THANH TOÃN, Há»¦Y VÃ‰ & VÃ‰ Cá»¦A TÃ”I
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'hold');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'hold', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'{
+      DECLARE
+        v_list SYS.ODCINUMBERLIST := SYS.ODCINUMBERLIST();
+        v_raw  VARCHAR2(4000) := REGEXP_REPLACE(:p_seat_ids, '[^0-9,]', '');
+        v_part VARCHAR2(50); v_idx NUMBER := 1; v_bk NUMBER; v_exp TIMESTAMP;
+      BEGIN
+        LOOP
+          v_part := REGEXP_SUBSTR(v_raw, '[^,]+', 1, v_idx);
+          EXIT WHEN v_part IS NULL;
+          v_list.EXTEND; v_list(v_list.COUNT) := TO_NUMBER(v_part); v_idx := v_idx + 1;
+        END LOOP;
+        pkg_booking.sp_hold_seats(:p_customer_id, :p_showtime_id, v_list, v_bk);
+        SELECT expires_at INTO v_exp FROM booking WHERE booking_id = v_bk;
+        :booking_id := v_bk;
+        :expires_at := TO_CHAR(v_exp, 'YYYY-MM-DD"T"HH24:MI:SS');
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    }'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'hold', p_method => 'POST', p_name => 'booking_id', p_bind_variable_name => 'booking_id', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'hold', p_method => 'POST', p_name => 'expires_at', p_bind_variable_name => 'expires_at', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'hold', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'confirm');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'confirm', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      BEGIN
+        pkg_booking.sp_confirm_booking(:p_booking_id, :p_promo_code, :p_method, :p_combos);
+        SELECT booking_id, subtotal, discount_amount, final_amount
+          INTO :booking_id, :subtotal, :discount_amount, :final_amount
+          FROM booking WHERE booking_id = :p_booking_id;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'confirm', p_method => 'POST', p_name => 'booking_id', p_bind_variable_name => 'booking_id', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'confirm', p_method => 'POST', p_name => 'subtotal', p_bind_variable_name => 'subtotal', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'confirm', p_method => 'POST', p_name => 'discount_amount', p_bind_variable_name => 'discount_amount', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'confirm', p_method => 'POST', p_name => 'final_amount', p_bind_variable_name => 'final_amount', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'confirm', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'cancel');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'cancel', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      BEGIN
+        pkg_booking.sp_cancel_booking(:p_booking_id, :p_customer_id);
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'cancel', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'mybookings');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'mybookings', p_method => 'GET',
+    p_source_type => 'json/collection',
+    p_source      => q'[
+      SELECT b.booking_id,
+             CASE WHEN b.status = 'PENDING' AND b.expires_at < SYSTIMESTAMP THEN 'EXPIRED' ELSE b.status END AS status,
+             m.title,
+             TO_CHAR(st.start_time, 'YYYY-MM-DD"T"HH24:MI:SS') AS start_time,
+             r.name AS room_name,
+             NVL(
+               (SELECT LISTAGG(s.row_label || s.seat_no, ', ') WITHIN GROUP (ORDER BY s.row_label, s.seat_no)
+                  FROM ticket tk JOIN seat s ON s.seat_id = tk.seat_id WHERE tk.booking_id = b.booking_id),
+               (SELECT LISTAGG(s.row_label || s.seat_no, ', ') WITHIN GROUP (ORDER BY s.row_label, s.seat_no)
+                  FROM showtime_seat ss JOIN seat s ON s.seat_id = ss.seat_id WHERE ss.booking_id = b.booking_id)
+             ) AS seats,
+             NVL(b.final_amount, 0) AS final_amount,
+             b.showtime_id, b.subtotal, b.discount_amount,
+             TO_CHAR(b.expires_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS exp
+        FROM booking b
+        JOIN showtime st ON st.showtime_id = b.showtime_id
+        JOIN movie m ON m.movie_id = st.movie_id
+        JOIN room r ON r.room_id = st.room_id
+       WHERE b.customer_id = :customer_id
+       ORDER BY b.booking_id DESC
+    ]'
+  );
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'booking/:id');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'booking/:id', p_method => 'GET',
+    p_source_type => 'json/item',
+    p_source      => q'~
+      SELECT b.booking_id,
+             TO_CHAR(b.expires_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS expires_at,
+             b.showtime_id,
+             '[' || (SELECT LISTAGG(ss.seat_id, ',') WITHIN GROUP (ORDER BY ss.seat_id)
+                       FROM showtime_seat ss WHERE ss.booking_id = b.booking_id) || ']' AS "seat_ids{}"
+        FROM booking b
+       WHERE b.booking_id = :id AND b.customer_id = :customer_id AND b.status = 'PENDING' AND b.expires_at > SYSTIMESTAMP
+    ~'
+  );
+
+  -- 4. COMBO & KHUYáº¾N MÃƒI
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'combos');
+  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'combos', p_method => 'GET', p_source_type => 'json/collection', p_source => 'SELECT combo_id, name, description AS "desc", price FROM combo WHERE is_active = 1 ORDER BY combo_id');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'combos', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      BEGIN
+        INSERT INTO combo(name, description, price) VALUES (:name, :desc, :price);
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'combos', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'combos/:id');
+  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'combos/:id', p_method => 'DELETE', p_source_type => 'plsql/block', p_source => 'BEGIN UPDATE combo SET is_active = 0 WHERE combo_id = :id; COMMIT; END;');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'promos');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'promos', p_method => 'GET',
+    p_source_type => 'json/collection',
+    p_source      => q'[
+      SELECT code, discount_type AS type, discount_value AS value, max_discount AS max, min_amount AS min,
+             max_uses AS "maxUses", used_count AS used,
+             CASE WHEN conditions IS NOT NULL THEN JSON_QUERY(conditions, '$.days') ELSE 'null' END AS "days{}",
+             CASE WHEN is_active = 1 THEN 'true' ELSE 'false' END AS "active{}"
+        FROM promotion ORDER BY code
+    ]'
+  );
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'promos', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE
+        v_obj JSON_OBJECT_T := JSON_OBJECT_T.parse(:body_text);
+        v_code VARCHAR2(30) := UPPER(TRIM(v_obj.get_String('code')));
+        v_cnt NUMBER; v_days JSON_ARRAY_T; v_cond VARCHAR2(500) := NULL;
+      BEGIN
+        SELECT COUNT(*) INTO v_cnt FROM promotion WHERE code = v_code;
+        IF v_cnt > 0 THEN RAISE_APPLICATION_ERROR(-20070, 'MÃ£ khuyáº¿n mÃ£i Ä‘Ã£ tá»“n táº¡i'); END IF;
+        IF v_obj.has('days') AND NOT v_obj.get('days').is_null THEN
+          v_days := v_obj.get_Array('days');
+          IF v_days.get_size > 0 THEN v_cond := '{"days":' || v_days.to_string() || '}'; END IF;
+        END IF;
+        INSERT INTO promotion(code, discount_type, discount_value, max_discount, min_amount, valid_from, valid_to, max_uses, used_count, is_active, conditions)
+        VALUES (
+          v_code, v_obj.get_String('type'), TO_NUMBER(v_obj.get_String('value')),
+          CASE WHEN v_obj.has('max') AND NOT v_obj.get('max').is_null THEN TO_NUMBER(v_obj.get_String('max')) ELSE NULL END,
+          CASE WHEN v_obj.has('min') AND NOT v_obj.get('min').is_null THEN TO_NUMBER(v_obj.get_String('min')) ELSE 0 END,
+          DATE '2026-01-01', DATE '2026-12-31',
+          CASE WHEN v_obj.has('maxUses') AND NOT v_obj.get('maxUses').is_null THEN TO_NUMBER(v_obj.get_String('maxUses')) ELSE NULL END,
+          0, 1, CASE WHEN v_cond IS NOT NULL THEN JSON(v_cond) ELSE NULL END
+        );
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'promos', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'promos/:code/toggle');
+  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'promos/:code/toggle', p_method => 'POST', p_source_type => 'plsql/block', p_source => 'BEGIN UPDATE promotion SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE code = UPPER(:code); COMMIT; END;');
+
+  -- 5. TÃ€I KHOáº¢N, Há»’ SÆ  & Máº¬T KHáº¨U
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'register');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'register', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE v_id NUMBER; v_cnt NUMBER;
+      BEGIN
+        IF fn_is_strong_password(:p_password) = 0 THEN RAISE_APPLICATION_ERROR(-20060, 'Máº­t kháº©u pháº£i cÃ³ Ã­t nháº¥t 8 kÃ½ tá»±, gá»“m chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  sá»‘'); END IF;
+        SELECT COUNT(*) INTO v_cnt FROM customer WHERE LOWER(email) = LOWER(TRIM(:p_email));
+        IF v_cnt > 0 THEN RAISE_APPLICATION_ERROR(-20061, 'Email Ä‘Ã£ Ä‘Æ°á»£c Ä‘Äƒng kÃ½'); END IF;
+        INSERT INTO customer(full_name, email, password_hash, role) VALUES (TRIM(:p_full_name), LOWER(TRIM(:p_email)), STANDARD_HASH(:p_password, 'SHA256'), 'CUSTOMER') RETURNING customer_id INTO v_id;
+        COMMIT;
+        :customer_id := v_id;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'register', p_method => 'POST', p_name => 'customer_id', p_bind_variable_name => 'customer_id', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'register', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'login');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'login', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      BEGIN
+        SELECT customer_id, full_name, role INTO :customer_id, :full_name, :role
+          FROM customer WHERE LOWER(email) = LOWER(TRIM(:p_email)) AND password_hash = STANDARD_HASH(:p_password, 'SHA256');
+      EXCEPTION
+        WHEN NO_DATA_FOUND THEN :status_code := 401; :error := 'ORA-20062: Email hoáº·c máº­t kháº©u khÃ´ng Ä‘Ãºng';
+        WHEN OTHERS THEN :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'login', p_method => 'POST', p_name => 'customer_id', p_bind_variable_name => 'customer_id', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'login', p_method => 'POST', p_name => 'full_name', p_bind_variable_name => 'full_name', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'login', p_method => 'POST', p_name => 'role', p_bind_variable_name => 'role', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'login', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'profile');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'profile', p_method => 'GET',
+    p_source_type => 'json/item',
+    p_source      => q'[
+      SELECT customer_id, full_name, email, NVL(phone, '') AS phone,
+             NVL(TO_CHAR(birth_date, 'YYYY-MM-DD'), '') AS birth,
+             NVL(gender, '') AS gender, NVL(address, '') AS address
+        FROM customer WHERE customer_id = :customer_id
+    ]'
+  );
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'profile', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'{
+      BEGIN
+        IF :p_phone IS NOT NULL AND NOT REGEXP_LIKE(REPLACE(:p_phone, ' ', ''), '^(0|\+84)\d{9,10}$') THEN RAISE_APPLICATION_ERROR(-20065, 'Sá»‘ Ä‘iá»‡n thoáº¡i khÃ´ng há»£p lá»‡'); END IF;
+        IF :p_birth_date IS NOT NULL AND TO_DATE(:p_birth_date, 'YYYY-MM-DD') > TRUNC(SYSDATE) THEN RAISE_APPLICATION_ERROR(-20066, 'NgÃ y sinh khÃ´ng há»£p lá»‡'); END IF;
+        UPDATE customer
+           SET full_name = :p_full_name, phone = :p_phone,
+               birth_date = CASE WHEN :p_birth_date IS NOT NULL THEN TO_DATE(:p_birth_date, 'YYYY-MM-DD') ELSE NULL END,
+               gender = :p_gender, address = :p_address
+         WHERE customer_id = :p_customer_id;
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    }'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'profile', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'password');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'password', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE v_cnt NUMBER;
+      BEGIN
+        SELECT COUNT(*) INTO v_cnt FROM customer WHERE customer_id = :p_customer_id AND password_hash = STANDARD_HASH(:p_old, 'SHA256');
+        IF v_cnt = 0 THEN RAISE_APPLICATION_ERROR(-20062, 'Máº­t kháº©u hiá»‡n táº¡i khÃ´ng Ä‘Ãºng'); END IF;
+        IF fn_is_strong_password(:p_new) = 0 THEN RAISE_APPLICATION_ERROR(-20060, 'Máº­t kháº©u má»›i pháº£i cÃ³ Ã­t nháº¥t 8 kÃ½ tá»±, gá»“m chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  sá»‘'); END IF;
+        UPDATE customer SET password_hash = STANDARD_HASH(:p_new, 'SHA256') WHERE customer_id = :p_customer_id;
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'password', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'forgot');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'forgot', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE v_otp VARCHAR2(10) := TO_CHAR(TRUNC(DBMS_RANDOM.VALUE(100000, 999999)));
+      BEGIN
+        UPDATE customer SET otp_code = v_otp, otp_expires_at = SYSTIMESTAMP + INTERVAL '10' MINUTE WHERE LOWER(email) = LOWER(TRIM(:p_email));
+        IF SQL%ROWCOUNT = 0 THEN RAISE_APPLICATION_ERROR(-20063, 'Email chÆ°a Ä‘Æ°á»£c Ä‘Äƒng kÃ½'); END IF;
+        COMMIT;
+        :otp := v_otp;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'forgot', p_method => 'POST', p_name => 'otp', p_bind_variable_name => 'otp', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'forgot', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'reset');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'reset', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      DECLARE v_cnt NUMBER;
+      BEGIN
+        SELECT COUNT(*) INTO v_cnt FROM customer WHERE LOWER(email) = LOWER(TRIM(:p_email)) AND otp_code = :p_otp AND otp_expires_at >= SYSTIMESTAMP;
+        IF v_cnt = 0 THEN RAISE_APPLICATION_ERROR(-20064, 'MÃ£ OTP khÃ´ng Ä‘Ãºng hoáº·c Ä‘Ã£ háº¿t háº¡n'); END IF;
+        IF fn_is_strong_password(:p_new) = 0 THEN RAISE_APPLICATION_ERROR(-20060, 'Máº­t kháº©u má»›i pháº£i cÃ³ Ã­t nháº¥t 8 kÃ½ tá»±, gá»“m chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  sá»‘'); END IF;
+        UPDATE customer SET password_hash = STANDARD_HASH(:p_new, 'SHA256'), otp_code = NULL, otp_expires_at = NULL WHERE LOWER(email) = LOWER(TRIM(:p_email));
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'reset', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  -- 6. ÄÃNH GIÃ & QUáº¢N TRá»Š
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'reviews');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'reviews', p_method => 'GET',
+    p_source_type => 'json/collection',
+    p_source      => q'[
+      SELECT r.review_id, r.movie_id, r.customer_id, c.full_name AS name, r.rating, r.content AS text,
+             TO_CHAR(r.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS at
+        FROM review r JOIN customer c ON c.customer_id = r.customer_id
+       WHERE r.movie_id = :movie_id ORDER BY r.created_at DESC
+    ]'
+  );
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'reviews', p_method => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'[
+      BEGIN
+        IF :p_rating NOT BETWEEN 1 AND 5 THEN RAISE_APPLICATION_ERROR(-20080, 'Äiá»ƒm Ä‘Ã¡nh giÃ¡ tá»« 1 Ä‘áº¿n 5'); END IF;
+        MERGE INTO review r USING (SELECT :p_movie_id AS movie_id, :p_customer_id AS customer_id FROM dual) src
+           ON (r.movie_id = src.movie_id AND r.customer_id = src.customer_id)
+        WHEN MATCHED THEN UPDATE SET r.rating = :p_rating, r.content = :p_content, r.created_at = SYSTIMESTAMP
+        WHEN NOT MATCHED THEN INSERT (movie_id, customer_id, rating, content) VALUES (:p_movie_id, :p_customer_id, :p_rating, :p_content);
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN ROLLBACK; :status_code := 400; :error := SQLERRM;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'reviews', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'revenue');
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api', p_pattern => 'revenue', p_method => 'GET',
+    p_source_type => 'json/collection',
+    p_source      => q'[
+      SELECT m.title, TO_CHAR(TRUNC(st.start_time), 'YYYY-MM-DD') AS show_date,
+             COUNT(tk.ticket_id) AS tickets_sold, NVL(SUM(tk.price), 0) AS gross_revenue
+        FROM ticket tk
+        JOIN booking b ON b.booking_id = tk.booking_id AND b.status = 'PAID'
+        JOIN showtime st ON st.showtime_id = b.showtime_id
+        JOIN movie m ON m.movie_id = st.movie_id
+       GROUP BY m.title, TRUNC(st.start_time)
+       ORDER BY TRUNC(st.start_time) DESC, gross_revenue DESC
+    ]'
+  );
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'audit');
+  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'audit', p_method => 'GET', p_source_type => 'json/collection', p_source => 'SELECT log_id, table_name, record_id, action, old_value, new_value, TO_CHAR(changed_at, ''YYYY-MM-DD"T"HH24:MI:SS'') AS changed_at FROM audit_log ORDER BY log_id DESC');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'customers');
+  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'customers', p_method => 'GET', p_source_type => 'json/collection', p_source => 'SELECT customer_id, full_name, email, phone, role FROM customer ORDER BY customer_id');
+
+  ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'role');
+  ORDS.DEFINE_HANDLER(p_module_name => 'cinema_api', p_pattern => 'role', p_method => 'POST', p_source_type => 'plsql/block', p_source => 'BEGIN UPDATE customer SET role = :p_role WHERE customer_id = :p_customer_id; COMMIT; END;');
+
+  -- Cáº¤P QUYá»€N CORS LUÃ”N Táº I ÄÃ‚Y
+  ORDS.SET_MODULE_ORIGINS_ALLOWED(
+    p_module_name     => 'cinema_api',
+    p_origins_allowed => 'http://127.0.0.1:5500,http://localhost:5500'
+  );
+
+  COMMIT;
+END;
+
+===== C:\Users\Khai\cinema-booking\phim.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="phim"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\quan-tri-dang-nhap.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="qtdangnhap"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\quan-tri.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="quantri"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\quen-mat-khau.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="quenmk"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\rap.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="rap"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\Script-3.sql =====
+-- 1. Sá»­a láº¡i hÃ m FN_CALC_DISCOUNT (Ä‘Æ°a JSON_SERIALIZE vÃ o cÃ¢u SELECT SQL)
+CREATE OR REPLACE FUNCTION fn_calc_discount(
+  p_promo_code  IN VARCHAR2,
+  p_subtotal    IN NUMBER,
+  p_showtime_id IN NUMBER
+) RETURN NUMBER IS
+  v_type       promotion.discount_type%TYPE;
+  v_val        promotion.discount_value%TYPE;
+  v_max        promotion.max_discount%TYPE;
+  v_min        promotion.min_amount%TYPE;
+  v_from       promotion.valid_from%TYPE;
+  v_to         promotion.valid_to%TYPE;
+  v_max_uses   promotion.max_uses%TYPE;
+  v_used       promotion.used_count%TYPE;
+  v_active     promotion.is_active%TYPE;
+  v_cond_txt   VARCHAR2(4000);
+  v_start_time showtime.start_time%TYPE;
+  v_show_day   VARCHAR2(10);
+  v_obj        JSON_OBJECT_T;
+  v_arr        JSON_ARRAY_T;
+  v_day_ok     BOOLEAN;
+  v_disc       NUMBER := 0;
+BEGIN
+  IF p_promo_code IS NULL OR TRIM(p_promo_code) = '' THEN
+    RETURN 0;
+  END IF;
+
+  BEGIN
+    SELECT discount_type, discount_value, max_discount, NVL(min_amount, 0),
+           valid_from, valid_to, max_uses, used_count, is_active,
+           JSON_SERIALIZE(conditions RETURNING VARCHAR2(4000))
+      INTO v_type, v_val, v_max, v_min,
+           v_from, v_to, v_max_uses, v_used, v_active, v_cond_txt
+      FROM promotion
+     WHERE code = UPPER(TRIM(p_promo_code));
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      RAISE_APPLICATION_ERROR(-20034, 'MÃ£ khuyáº¿n mÃ£i khÃ´ng tá»“n táº¡i');
+  END;
+
+  IF v_active <> 1 OR TRUNC(SYSDATE) NOT BETWEEN v_from AND v_to THEN
+    RAISE_APPLICATION_ERROR(-20034, 'MÃ£ khuyáº¿n mÃ£i khÃ´ng tá»“n táº¡i hoáº·c Ä‘Ã£ háº¿t háº¡n');
+  END IF;
+
+  IF v_max_uses IS NOT NULL AND v_used >= v_max_uses THEN
+    RAISE_APPLICATION_ERROR(-20031, 'MÃ£ khuyáº¿n mÃ£i Ä‘Ã£ háº¿t lÆ°á»£t dÃ¹ng');
+  END IF;
+
+  IF p_subtotal < v_min THEN
+    RAISE_APPLICATION_ERROR(-20032, 'ChÆ°a Ä‘áº¡t giÃ¡ trá»‹ Ä‘Æ¡n tá»‘i thiá»ƒu');
+  END IF;
+
+  IF v_cond_txt IS NOT NULL THEN
+    v_obj := JSON_OBJECT_T.parse(v_cond_txt);
+    IF v_obj.has('days') AND NOT v_obj.get('days').is_null THEN
+      v_arr := v_obj.get_Array('days');
+      IF v_arr.get_size > 0 THEN
+        SELECT start_time INTO v_start_time
+          FROM showtime WHERE showtime_id = p_showtime_id;
+        v_show_day := TO_CHAR(v_start_time, 'DY', 'NLS_DATE_LANGUAGE=AMERICAN');
+        v_day_ok := FALSE;
+        FOR i IN 0 .. v_arr.get_size - 1 LOOP
+          IF UPPER(v_arr.get_String(i)) = v_show_day THEN
+            v_day_ok := TRUE;
+            EXIT;
+          END IF;
+        END LOOP;
+        IF NOT v_day_ok THEN
+          RAISE_APPLICATION_ERROR(-20033, 'MÃ£ khÃ´ng Ã¡p dá»¥ng cho ngÃ y chiáº¿u nÃ y');
+        END IF;
+      END IF;
+    END IF;
+  END IF;
+
+  IF v_type = 'PERCENT' THEN
+    v_disc := p_subtotal * v_val / 100;
+  ELSE
+    v_disc := v_val;
+  END IF;
+
+  IF v_max IS NOT NULL THEN
+    v_disc := LEAST(v_disc, v_max);
+  END IF;
+
+  RETURN LEAST(ROUND(v_disc, -3), p_subtotal);
+END fn_calc_discount;
+/
+
+-- 2. Táº¡o láº¡i hÃ m MLE FN_IS_STRONG_PASSWORD
+CREATE OR REPLACE FUNCTION fn_is_strong_password(p_password VARCHAR2)
+RETURN NUMBER
+AS MLE MODULE mod_password_check
+SIGNATURE 'isStrongPassword(string)';
+/
+
+-- 3. BiÃªn dá»‹ch láº¡i 2 Ä‘á»‘i tÆ°á»£ng phá»¥ thuá»™c
+ALTER PROCEDURE sp_register_customer COMPILE;
+ALTER PACKAGE pkg_booking COMPILE BODY;
+SELECT object_name, object_type, status FROM user_objects WHERE status <> 'VALID';
+-- 1. Äáº·t chuá»™t vÃ o Ä‘Ã¢y vÃ  báº¥m Ctrl + Enter
+BEGIN
+  EXECUTE IMMEDIATE q'[
+    CREATE OR REPLACE FUNCTION fn_is_strong_password(p_password VARCHAR2)
+    RETURN NUMBER
+    AS MLE MODULE mod_password_check
+    SIGNATURE 'isStrongPassword(string)';
+  ]';
+END;
+-- 2. Äáº·t chuá»™t vÃ o dÃ²ng nÃ y vÃ  báº¥m Ctrl + Enter
+ALTER PROCEDURE sp_register_customer COMPILE;
+
+===== C:\Users\Khai\cinema-booking\Script-4.sql =====
+-- ============================================================
+-- Má»ž Rá»˜NG CSDL CINEDB (Cháº¡y báº±ng Alt + X trÃªn CINEMA_SCHEMA)
+-- ============================================================
+
+-- 1. Má»Ÿ rá»™ng cÃ¡c báº£ng hiá»‡n cÃ³
+ALTER TABLE theater ADD (city VARCHAR2(60));
+UPDATE theater SET city = 'TP. Há»“ ChÃ­ Minh' WHERE city IS NULL;
+
+ALTER TABLE customer ADD (
+  role           VARCHAR2(10) DEFAULT 'CUSTOMER' NOT NULL CHECK (role IN ('CUSTOMER','ADMIN')),
+  birth_date     DATE,
+  gender         VARCHAR2(10),
+  address        VARCHAR2(200),
+  otp_code       VARCHAR2(10),
+  otp_expires_at TIMESTAMP
+);
+
+ALTER TABLE movie ADD (
+  status VARCHAR2(5) DEFAULT 'NOW' NOT NULL CHECK (status IN ('NOW','SOON'))
+);
+
+-- 2. Táº¡o cÃ¡c báº£ng má»Ÿ rá»™ng (Combo báº¯p nÆ°á»›c & ÄÃ¡nh giÃ¡ phim)
+CREATE TABLE combo (
+  combo_id    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name        VARCHAR2(100) NOT NULL,
+  description VARCHAR2(300),
+  price       NUMBER(10) NOT NULL CHECK (price >= 0),
+  is_active   NUMBER(1) DEFAULT 1 NOT NULL
+);
+
+CREATE TABLE booking_combo (
+  booking_id NUMBER NOT NULL REFERENCES booking(booking_id),
+  combo_id   NUMBER NOT NULL REFERENCES combo(combo_id),
+  qty        NUMBER(2) NOT NULL CHECK (qty BETWEEN 1 AND 10),
+  unit_price NUMBER(10) NOT NULL,
+  CONSTRAINT pk_booking_combo PRIMARY KEY (booking_id, combo_id)
+);
+
+ALTER TABLE booking ADD (combo_amount NUMBER(10) DEFAULT 0 NOT NULL);
+
+CREATE TABLE review (
+  review_id   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  movie_id    NUMBER NOT NULL REFERENCES movie(movie_id),
+  customer_id NUMBER NOT NULL REFERENCES customer(customer_id),
+  rating      NUMBER(1) NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  content     VARCHAR2(1000),
+  created_at  TIMESTAMP DEFAULT SYSTIMESTAMP,
+  CONSTRAINT uq_review UNIQUE (movie_id, customer_id)
+);
+
+-- 3. Cáº­p nháº­t package pkg_booking Ä‘á»ƒ sp_confirm_booking xá»­ lÃ½ combo
+CREATE OR REPLACE PACKAGE pkg_booking IS
+  PROCEDURE sp_hold_seats(
+    p_customer_id IN NUMBER, p_showtime_id IN NUMBER,
+    p_seat_ids IN SYS.ODCINUMBERLIST, p_booking_id OUT NUMBER
+  );
+
+  PROCEDURE sp_confirm_booking(
+    p_booking_id IN NUMBER, p_promo_code IN VARCHAR2,
+    p_method IN VARCHAR2, p_combos IN VARCHAR2 DEFAULT NULL
+  );
+
+  PROCEDURE sp_cancel_booking(
+    p_booking_id IN NUMBER, p_customer_id IN NUMBER
+  );
+
+  PROCEDURE sp_release_expired_holds;
+  PROCEDURE sp_daily_revenue_report(p_date IN DATE DEFAULT TRUNC(SYSDATE));
+
+  FUNCTION fn_check_room_overlap(
+    p_room_id NUMBER, p_start TIMESTAMP, p_end TIMESTAMP,
+    p_exclude_id NUMBER DEFAULT NULL) RETURN NUMBER;
+
+  PROCEDURE sp_add_showtime(
+    p_movie_id NUMBER, p_room_id NUMBER, p_start TIMESTAMP, p_end TIMESTAMP,
+    p_base_price NUMBER, p_showtime_id OUT NUMBER);
+END pkg_booking;
+/
+
+CREATE OR REPLACE PACKAGE BODY pkg_booking IS
+
+  PROCEDURE sp_hold_seats(
+    p_customer_id IN NUMBER, p_showtime_id IN NUMBER,
+    p_seat_ids IN SYS.ODCINUMBERLIST, p_booking_id OUT NUMBER) IS
+    c_hold_minutes CONSTANT NUMBER := 10;
+    v_expire TIMESTAMP := SYSTIMESTAMP + NUMTODSINTERVAL(c_hold_minutes, 'MINUTE');
+    v_start TIMESTAMP; v_status VARCHAR2(10);
+  BEGIN
+    SELECT start_time, status INTO v_start, v_status
+      FROM showtime WHERE showtime_id = p_showtime_id;
+    IF v_status <> 'OPEN' OR v_start <= SYSTIMESTAMP THEN
+      RAISE_APPLICATION_ERROR(-20012, 'Suáº¥t chiáº¿u Ä‘Ã£ Ä‘Ã³ng bÃ¡n');
+    END IF;
+
+    IF p_seat_ids IS NULL OR p_seat_ids.COUNT NOT BETWEEN 1 AND 8 THEN
+      RAISE_APPLICATION_ERROR(-20010, 'Má»—i Ä‘Æ¡n Ä‘áº·t tá»« 1 Ä‘áº¿n 8 gháº¿');
+    END IF;
+
+    SAVEPOINT sp_start;
+
+    INSERT INTO booking(customer_id, showtime_id, status, expires_at)
+    VALUES (p_customer_id, p_showtime_id, 'PENDING', v_expire)
+    RETURNING booking_id INTO p_booking_id;
+
+    FOR r IN (SELECT column_value AS seat_id FROM TABLE(p_seat_ids) ORDER BY 1) LOOP
+      UPDATE showtime_seat
+         SET status = 'HELD', held_by = p_customer_id,
+             hold_expires_at = v_expire, booking_id = p_booking_id
+       WHERE showtime_id = p_showtime_id AND seat_id = r.seat_id
+         AND (status = 'AVAILABLE'
+              OR (status = 'HELD' AND hold_expires_at < SYSTIMESTAMP));
+      IF SQL%ROWCOUNT = 0 THEN
+        ROLLBACK TO sp_start;
+        RAISE_APPLICATION_ERROR(-20011,
+          'Gháº¿ ' || r.seat_id || ' Ä‘Ã£ cÃ³ ngÆ°á»i giá»¯ hoáº·c Ä‘Ã£ bÃ¡n');
+      END IF;
+    END LOOP;
+    COMMIT;
+  END sp_hold_seats;
+
+  PROCEDURE sp_confirm_booking(
+    p_booking_id IN NUMBER, p_promo_code IN VARCHAR2,
+    p_method IN VARCHAR2, p_combos IN VARCHAR2 DEFAULT NULL) IS
+    v_status      VARCHAR2(10);
+    v_expires_at  TIMESTAMP;
+    v_showtime_id NUMBER;
+    v_total NUMBER; v_cnt NUMBER;
+    v_subtotal NUMBER; v_discount NUMBER;
+    v_combo_amt NUMBER := 0;
+    v_obj JSON_OBJECT_T;
+    v_keys JSON_KEY_LIST;
+    v_cid NUMBER; v_qty NUMBER; v_cprice NUMBER;
+  BEGIN
+    SELECT status, expires_at, showtime_id
+      INTO v_status, v_expires_at, v_showtime_id
+      FROM booking WHERE booking_id = p_booking_id FOR UPDATE;
+    IF v_status <> 'PENDING' OR v_expires_at < SYSTIMESTAMP THEN
+      RAISE_APPLICATION_ERROR(-20020, 'ÄÆ¡n khÃ´ng cÃ²n hiá»‡u lá»±c');
+    END IF;
+
+    SELECT COUNT(*) INTO v_total FROM showtime_seat WHERE booking_id = p_booking_id;
+
+    INSERT INTO ticket(booking_id, showtime_id, seat_id, price)
+    SELECT booking_id, showtime_id, seat_id, fn_calc_ticket_price(showtime_id, seat_id)
+      FROM showtime_seat
+     WHERE booking_id = p_booking_id AND status = 'HELD'
+       AND hold_expires_at >= SYSTIMESTAMP;
+    v_cnt := SQL%ROWCOUNT;
+    IF v_cnt = 0 OR v_cnt <> v_total THEN
+      RAISE_APPLICATION_ERROR(-20021, 'CÃ³ gháº¿ Ä‘Ã£ háº¿t háº¡n giá»¯ chá»—');
+    END IF;
+
+    IF p_combos IS NOT NULL AND TRIM(p_combos) NOT IN ('', '{}', 'null') THEN
+      v_obj := JSON_OBJECT_T.parse(p_combos);
+      v_keys := v_obj.get_keys;
+      FOR i IN 1 .. v_keys.COUNT LOOP
+        v_cid := TO_NUMBER(v_keys(i));
+        v_qty := v_obj.get_Number(v_keys(i));
+        IF v_qty > 0 THEN
+          SELECT price INTO v_cprice FROM combo WHERE combo_id = v_cid AND is_active = 1;
+          INSERT INTO booking_combo(booking_id, combo_id, qty, unit_price)
+          VALUES (p_booking_id, v_cid, v_qty, v_cprice);
+          v_combo_amt := v_combo_amt + (v_qty * v_cprice);
+        END IF;
+      END LOOP;
+    END IF;
+
+    SELECT SUM(price) INTO v_subtotal FROM ticket WHERE booking_id = p_booking_id;
+    v_discount := fn_calc_discount(p_promo_code, v_subtotal, v_showtime_id);
+
+    IF v_discount > 0 THEN
+      UPDATE promotion SET used_count = used_count + 1
+       WHERE code = UPPER(p_promo_code)
+         AND (max_uses IS NULL OR used_count < max_uses);
+      IF SQL%ROWCOUNT = 0 THEN
+        RAISE_APPLICATION_ERROR(-20031, 'MÃ£ khuyáº¿n mÃ£i Ä‘Ã£ háº¿t lÆ°á»£t dÃ¹ng');
+      END IF;
+    END IF;
+
+    UPDATE showtime_seat SET status = 'SOLD', held_by = NULL, hold_expires_at = NULL
+     WHERE booking_id = p_booking_id;
+    UPDATE booking SET subtotal = v_subtotal, discount_amount = v_discount,
+           combo_amount = v_combo_amt,
+           final_amount = v_subtotal - v_discount + v_combo_amt,
+           promo_code = UPPER(p_promo_code),
+           status = 'PAID', paid_at = SYSTIMESTAMP
+     WHERE booking_id = p_booking_id;
+    INSERT INTO payment(booking_id, method, amount, status, paid_at)
+    VALUES (p_booking_id, p_method, v_subtotal - v_discount + v_combo_amt, 'SUCCESS', SYSTIMESTAMP);
+    COMMIT;
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+      RAISE;
+  END sp_confirm_booking;
+
+  PROCEDURE sp_release_expired_holds IS
+  BEGIN
+    UPDATE showtime_seat
+       SET status = 'AVAILABLE', held_by = NULL, hold_expires_at = NULL, booking_id = NULL
+     WHERE status = 'HELD' AND hold_expires_at < SYSTIMESTAMP;
+    UPDATE booking SET status = 'EXPIRED'
+     WHERE status = 'PENDING' AND expires_at < SYSTIMESTAMP;
+    COMMIT;
+  END sp_release_expired_holds;
+
+  PROCEDURE sp_daily_revenue_report(p_date IN DATE DEFAULT TRUNC(SYSDATE)) IS
+    CURSOR c_revenue IS
+      SELECT m.title, COUNT(*) AS tickets_sold, SUM(t.price) AS revenue
+        FROM ticket t
+        JOIN booking  b  ON b.booking_id = t.booking_id AND b.status = 'PAID'
+        JOIN showtime st ON st.showtime_id = t.showtime_id
+        JOIN movie    m  ON m.movie_id = st.movie_id
+       WHERE TRUNC(b.paid_at) = p_date
+       GROUP BY m.title
+       ORDER BY SUM(t.price) DESC;
+    v_title VARCHAR2(200); v_tickets_sold NUMBER; v_revenue NUMBER;
+    v_total_rev NUMBER := 0; v_total_tkt NUMBER := 0;
+  BEGIN
+    DBMS_OUTPUT.PUT_LINE('BAO CAO DOANH THU NGAY ' || TO_CHAR(p_date, 'DD/MM/YYYY'));
+    OPEN c_revenue;
+    LOOP
+      FETCH c_revenue INTO v_title, v_tickets_sold, v_revenue;
+      EXIT WHEN c_revenue%NOTFOUND;
+      DBMS_OUTPUT.PUT_LINE(RPAD(v_title, 35) || LPAD(v_tickets_sold, 10) || LPAD(TO_CHAR(v_revenue, '999,999,999'), 15));
+      v_total_rev := v_total_rev + v_revenue;
+      v_total_tkt := v_total_tkt + v_tickets_sold;
+    END LOOP;
+    CLOSE c_revenue;
+    DBMS_OUTPUT.PUT_LINE(RPAD('TONG CONG', 35) || LPAD(v_total_tkt, 10) || LPAD(TO_CHAR(v_total_rev, '999,999,999'), 15));
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF c_revenue%ISOPEN THEN CLOSE c_revenue; END IF;
+      RAISE;
+  END sp_daily_revenue_report;
+
+  PROCEDURE sp_cancel_booking(p_booking_id IN NUMBER, p_customer_id IN NUMBER) IS
+    v_bk_customer_id NUMBER; v_status VARCHAR2(10); v_showtime_id NUMBER;
+    v_promo_code VARCHAR2(30); v_final_amount NUMBER; v_start TIMESTAMP;
+  BEGIN
+    SELECT customer_id, status, showtime_id, promo_code, final_amount
+      INTO v_bk_customer_id, v_status, v_showtime_id, v_promo_code, v_final_amount
+      FROM booking WHERE booking_id = p_booking_id FOR UPDATE;
+    IF v_bk_customer_id <> p_customer_id THEN
+      RAISE_APPLICATION_ERROR(-20040, 'KhÃ´ng cÃ³ quyá»n huá»· Ä‘Æ¡n nÃ y');
+    ELSIF v_status NOT IN ('PENDING', 'PAID') THEN
+      RAISE_APPLICATION_ERROR(-20041, 'ÄÆ¡n khÃ´ng thá»ƒ huá»· á»Ÿ tráº¡ng thÃ¡i hiá»‡n táº¡i');
+    END IF;
+
+    IF v_status = 'PAID' THEN
+      SELECT start_time INTO v_start FROM showtime WHERE showtime_id = v_showtime_id;
+      IF v_start < SYSTIMESTAMP + INTERVAL '2' HOUR THEN
+        RAISE_APPLICATION_ERROR(-20042, 'Chá»‰ huá»· vÃ© Ä‘Ã£ thanh toÃ¡n trÆ°á»›c giá» chiáº¿u Ã­t nháº¥t 2 giá»');
+      END IF;
+      DELETE FROM ticket WHERE booking_id = p_booking_id;
+      INSERT INTO payment(booking_id, method, amount, status, paid_at)
+      VALUES (p_booking_id, 'REFUND', -v_final_amount, 'REFUNDED', SYSTIMESTAMP);
+      IF v_promo_code IS NOT NULL THEN
+        UPDATE promotion SET used_count = GREATEST(used_count - 1, 0) WHERE code = v_promo_code;
+      END IF;
+    END IF;
+
+    UPDATE showtime_seat
+       SET status = 'AVAILABLE', held_by = NULL, hold_expires_at = NULL, booking_id = NULL
+     WHERE booking_id = p_booking_id;
+    UPDATE booking SET status = 'CANCELLED' WHERE booking_id = p_booking_id;
+    COMMIT;
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+      RAISE;
+  END sp_cancel_booking;
+
+  FUNCTION fn_check_room_overlap(
+    p_room_id NUMBER, p_start TIMESTAMP, p_end TIMESTAMP,
+    p_exclude_id NUMBER DEFAULT NULL) RETURN NUMBER IS
+    v_cnt NUMBER;
+  BEGIN
+    SELECT COUNT(*) INTO v_cnt
+      FROM showtime s
+     WHERE s.room_id = p_room_id
+       AND s.status <> 'CANCELLED'
+       AND (p_exclude_id IS NULL OR s.showtime_id <> p_exclude_id)
+       AND s.start_time < p_end
+       AND s.end_time   > p_start;
+    RETURN v_cnt;
+  END fn_check_room_overlap;
+
+  PROCEDURE sp_add_showtime(
+    p_movie_id NUMBER, p_room_id NUMBER, p_start TIMESTAMP, p_end TIMESTAMP,
+    p_base_price NUMBER, p_showtime_id OUT NUMBER) IS
+  BEGIN
+    IF fn_check_room_overlap(p_room_id, p_start, p_end) > 0 THEN
+      RAISE_APPLICATION_ERROR(-20050, 'PhÃ²ng Ä‘Ã£ cÃ³ suáº¥t chiáº¿u trÃ¹ng giá»');
+    END IF;
+    INSERT INTO showtime(movie_id, room_id, start_time, end_time, base_price, status)
+    VALUES (p_movie_id, p_room_id, p_start, p_end, p_base_price, 'OPEN')
+    RETURNING showtime_id INTO p_showtime_id;
+    COMMIT;
+  END sp_add_showtime;
+
+END pkg_booking;
+/
+
+-- 4. Dá»¯ liá»‡u máº«u bá»• sung (Admin, Combo, Khuyáº¿n mÃ£i)
+INSERT INTO customer(full_name, email, password_hash, role)
+VALUES ('Quáº£n trá»‹ viÃªn', 'admin@cinedb.vn', STANDARD_HASH('Admin123', 'SHA256'), 'ADMIN');
+
+INSERT INTO combo(name, description, price) VALUES ('Combo Báº¯p NÆ°á»›c', '1 báº¯p lá»›n vÃ  1 nÆ°á»›c', 79000);
+INSERT INTO combo(name, description, price) VALUES ('Combo ÄÃ´i', '2 báº¯p vÃ  2 nÆ°á»›c', 129000);
+INSERT INTO combo(name, description, price) VALUES ('NÆ°á»›c ngá»t', 'Ly lá»›n', 29000);
+
+INSERT INTO promotion(code, discount_type, discount_value, max_discount, min_amount, valid_from, valid_to, max_uses, used_count, is_active, conditions)
+VALUES ('GIAM50K', 'AMOUNT', 50000, NULL, 200000, DATE '2026-01-01', DATE '2026-12-31', 50, 0, 1, NULL);
+
+INSERT INTO promotion(code, discount_type, discount_value, max_discount, min_amount, valid_from, valid_to, max_uses, used_count, is_active, conditions)
+VALUES ('THU3', 'PERCENT', 15, 40000, 0, DATE '2026-01-01', DATE '2026-12-31', NULL, 0, 1, '{"days":["TUE"]}');
+
+-- 5. Táº¡o 2 Index tá»‘i Æ°u truy váº¥n (bá» qua náº¿u Ä‘Ã£ tá»“n táº¡i)
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE INDEX idx_ss_hold ON showtime_seat(status, hold_expires_at)';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE <> -955 THEN RAISE; END IF;
+END;
+/
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE INDEX idx_showtime_movie ON showtime(movie_id, start_time)';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE <> -955 THEN RAISE; END IF;
+END;
+/
+
+COMMIT;	
+
+===== C:\Users\Khai\cinema-booking\script_dbeaver.sql =====
+-- ============================================================
+-- script_dbeaver.sql â€” ToÃ n bá»™ CSDL "Há»‡ thá»‘ng Ä‘áº·t vÃ© xem phim trá»±c tuyáº¿n"
+-- (Oracle Database 23ai, Äá» tÃ i 6 â€“ NhÃ³m 3) â€” báº£n cháº¡y trong DBeaver
+--
+-- CÃCH CHáº Y TRONG DBEAVER:
+-- 1) Táº¡o káº¿t ná»‘i (connection) tá»›i Oracle Database 23ai trong DBeaver
+--    (Database > New Database Connection > Oracle), Ä‘iá»n Ä‘Ãºng
+--    host/port/service name vÃ  user/password.
+-- 2) Náº¿u CHÆ¯A cÃ³ user/schema riÃªng cho Ä‘á»“ Ã¡n: dÃ¹ng káº¿t ná»‘i báº±ng
+--    tÃ i khoáº£n QUáº¢N TRá»Š (SYS AS SYSDBA hoáº·c ADMIN) trÆ°á»›c, bá» dáº¥u
+--    comment khá»‘i BÆ¯á»šC 0 bÃªn dÆ°á»›i, Ä‘á»•i máº­t kháº©u, rá»“i cháº¡y riÃªng
+--    khá»‘i Ä‘Ã³. Sau Ä‘Ã³ táº¡o THÃŠM má»™t káº¿t ná»‘i DBeaver má»›i, dÃ¹ng chÃ­nh
+--    user cinema_app vá»«a táº¡o (DBeaver cáº§n má»™t connection riÃªng
+--    cho user má»›i, khÃ´ng chá»‰ Ä‘á»•i schema trong connection cÅ©).
+-- 3) Má»Ÿ káº¿t ná»‘i cinema_app, má»Ÿ file nÃ y trong SQL Editor, rá»“i cháº¡y
+--    TOÃ€N Bá»˜ báº±ng lá»‡nh "Execute SQL Script" (KHÃ”NG pháº£i "Execute
+--    SQL Statement"): phÃ­m táº¯t Alt+X (Windows/Linux) hoáº·c chá»n
+--    SQL Editor > Execute SQL Script trÃªn thanh menu. Cháº¡y báº±ng
+--    Ctrl+Enter (chá»‰ cháº¡y 1 cÃ¢u lá»‡nh) sáº½ bá»‹ dá»«ng ngang vÃ¬ script
+--    cÃ³ nhiá»u khá»‘i PL/SQL ná»‘i tiáº¿p nhau.
+-- 4) Muá»‘n xem DBMS_OUTPUT.PUT_LINE (vd káº¿t quáº£ bÃ¡o cÃ¡o doanh thu):
+--    má»Ÿ panel "DBMS Output" cá»§a DBeaver (thÆ°á»ng á»Ÿ khung káº¿t quáº£
+--    phÃ­a dÆ°á»›i SQL Editor, hoáº·c Window > Show View > DBMS Output)
+--    vÃ  báº¥m nÃºt báº­t (hÃ¬nh tam giÃ¡c/Enable) TRÆ¯á»šC khi cháº¡y script.
+-- ============================================================
+
+-- ---------- BÆ¯á»šC 0 (tuá»³ chá»n): Táº O USER â€” cháº¡y báº±ng tÃ i khoáº£n QUáº¢N TRá»Š ----------
+-- Bá» dáº¥u comment vÃ  Ä‘á»•i máº­t kháº©u trÆ°á»›c khi cháº¡y, náº¿u báº¡n chÆ°a cÃ³ user cinema_app.
+-- -- ============================================================
+-- -- 00_create_user.sql
+-- -- Cháº¡y báº±ng tÃ i khoáº£n QUáº¢N TRá»Š:
+-- --   - Oracle Database 23ai Free cÃ i local / Docker: connect SYS AS SYSDBA
+-- --     (hoáº·c SYSTEM) vÃ o PDB (vÃ­ dá»¥ FREEPDB1), KHÃ”NG cháº¡y trong CDB gá»‘c.
+-- --   - Oracle Cloud Autonomous Database (Always Free): connect báº±ng user ADMIN.
+-- -- Má»¥c Ä‘Ã­ch: táº¡o má»™t schema/user RIÃŠNG cho Ä‘á»“ Ã¡n, khÃ´ng dÃ¹ng chung
+-- -- vá»›i schema há»‡ thá»‘ng, Ä‘á»ƒ lá»¡ lÃ m sai chá»‰ cáº§n DROP USER rá»“i lÃ m láº¡i.
+-- -- ============================================================
+-- 
+-- -- Äá»•i máº­t kháº©u bÃªn dÆ°á»›i trÆ°á»›c khi cháº¡y (Oracle yÃªu cáº§u máº­t kháº©u Ä‘á»§ máº¡nh)!
+-- CREATE USER cinema_app IDENTIFIED BY "DoiMatKhauManh123#";
+-- 
+-- -- CÃ¡ch 1 (khuyáº¿n nghá»‹ cho Oracle Database 23ai Free):
+-- -- DB_DEVELOPER_ROLE lÃ  role dá»±ng sáºµn tá»« 23ai, Ä‘á»§ quyá»n Ä‘á»ƒ táº¡o báº£ng, view,
+-- -- function/procedure, trigger, job, MLE module... cho má»™t schema á»©ng dá»¥ng.
+-- GRANT DB_DEVELOPER_ROLE TO cinema_app;
+-- GRANT UNLIMITED TABLESPACE TO cinema_app;
+-- 
+-- -- CÃ¡ch 2 (dá»± phÃ²ng, dÃ¹ng khi báº£n Oracle Ä‘ang cÃ³ khÃ´ng há»— trá»£ DB_DEVELOPER_ROLE):
+-- -- bá» dáº¥u comment cÃ¡c dÃ²ng dÆ°á»›i rá»“i cháº¡y thay cho CÃ¡ch 1.
+-- -- GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE PROCEDURE,
+-- --       CREATE TRIGGER, CREATE SEQUENCE, CREATE TYPE, CREATE JOB
+-- --   TO cinema_app;
+-- -- GRANT UNLIMITED TABLESPACE TO cinema_app;
+-- 
+-- COMMIT;
+-- 
+-- -- Sau khi cháº¡y xong: ÄÃ“NG káº¿t ná»‘i admin, Má»ž káº¿t ná»‘i Má»šI báº±ng chÃ­nh
+-- -- user "cinema_app" (vÃ  máº­t kháº©u vá»«a Ä‘áº·t á»Ÿ trÃªn), rá»“i má»›i cháº¡y láº§n lÆ°á»£t
+-- -- cÃ¡c file 01 â†’ 09 trong thÆ° má»¥c nÃ y. Tá»« Ä‘Ã¢y vá» sau, má»i lá»‡nh Ä‘á»u cháº¡y
+-- -- báº±ng user cinema_app, khÃ´ng cháº¡y báº±ng tÃ i khoáº£n quáº£n trá»‹ ná»¯a.
+
+-- ---------- Tá»« Ä‘Ã¢y trá»Ÿ xuá»‘ng: cháº¡y báº±ng user cinema_app ----------
+
+-- ============================================================
+-- 01_tables.sql  (cháº¡y báº±ng user cinema_app)
+-- Táº¡o Ä‘á»§ 12 báº£ng theo Ä‘Ãºng ERD á»Ÿ ChÆ°Æ¡ng 2 cá»§a bÃ¡o cÃ¡o, theo Ä‘Ãºng
+-- thá»© tá»± Ä‘á»ƒ báº£ng sau khÃ´ng bá»‹ lá»—i "tham chiáº¿u tá»›i báº£ng chÆ°a tá»“n táº¡i".
+-- ============================================================
+
+-- 1) CUSTOMER â€” Ä‘á»™c láº­p, khÃ´ng phá»¥ thuá»™c báº£ng nÃ o khÃ¡c
+CREATE TABLE customer (
+  customer_id   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  full_name     VARCHAR2(100) NOT NULL,
+  email         VARCHAR2(100) NOT NULL UNIQUE,
+  phone         VARCHAR2(20),
+  password_hash VARCHAR2(200) NOT NULL,
+  created_at    TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+);
+
+-- 2) MOVIE â€” Ä‘á»™c láº­p
+CREATE TABLE movie (
+  movie_id      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title         VARCHAR2(200) NOT NULL,
+  genre         VARCHAR2(50),
+  duration_min  NUMBER NOT NULL CHECK (duration_min > 0),
+  rating        VARCHAR2(10),               -- vd: 'P','C13','C16','C18'
+  release_date  DATE,
+  metadata      VARCHAR2(4000)              -- JSON lÆ°u dáº¡ng chuá»—i kÃ½ tá»±
+                CHECK (metadata IS JSON)     -- Oracle tá»± kiá»ƒm tra Ä‘Ãºng Ä‘á»‹nh dáº¡ng JSON
+);
+
+-- 3) THEATER â€” Ä‘á»™c láº­p
+CREATE TABLE theater (
+  theater_id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name       VARCHAR2(100) NOT NULL,
+  address    VARCHAR2(200)
+);
+
+-- 4) ROOM â€” phá»¥ thuá»™c THEATER
+CREATE TABLE room (
+  room_id    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  theater_id NUMBER NOT NULL REFERENCES theater(theater_id),
+  name       VARCHAR2(50) NOT NULL,
+  room_type  VARCHAR2(10) DEFAULT '2D' NOT NULL
+             CHECK (room_type IN ('2D','3D','IMAX'))
+);
+
+-- 5) SEAT â€” phá»¥ thuá»™c ROOM
+CREATE TABLE seat (
+  seat_id   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id   NUMBER NOT NULL REFERENCES room(room_id),
+  row_label VARCHAR2(5) NOT NULL,
+  seat_no   NUMBER NOT NULL,
+  seat_type VARCHAR2(10) DEFAULT 'STANDARD' NOT NULL
+            CHECK (seat_type IN ('STANDARD','VIP','COUPLE')),
+  CONSTRAINT uq_seat UNIQUE (room_id, row_label, seat_no)
+);
+
+-- 6) SHOWTIME â€” phá»¥ thuá»™c MOVIE, ROOM
+CREATE TABLE showtime (
+  showtime_id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  movie_id    NUMBER NOT NULL REFERENCES movie(movie_id),
+  room_id     NUMBER NOT NULL REFERENCES room(room_id),
+  start_time  TIMESTAMP NOT NULL,
+  end_time    TIMESTAMP NOT NULL,
+  base_price  NUMBER NOT NULL CHECK (base_price >= 0),
+  status      VARCHAR2(10) DEFAULT 'OPEN' NOT NULL
+              CHECK (status IN ('OPEN','CLOSED','CANCELLED')),
+  CONSTRAINT ck_showtime_time CHECK (end_time > start_time)
+);
+
+-- 7) PROMOTION â€” Ä‘á»™c láº­p
+CREATE TABLE promotion (
+  promo_id       NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  code           VARCHAR2(30) NOT NULL UNIQUE,
+  discount_type  VARCHAR2(10) NOT NULL CHECK (discount_type IN ('PERCENT','AMOUNT')),
+  discount_value NUMBER NOT NULL CHECK (discount_value > 0),
+  max_discount   NUMBER,
+  min_amount     NUMBER,
+  valid_from     DATE NOT NULL,
+  valid_to       DATE NOT NULL,
+  max_uses       NUMBER,
+  used_count     NUMBER DEFAULT 0 NOT NULL,
+  is_active      NUMBER(1) DEFAULT 1 NOT NULL CHECK (is_active IN (0,1)),
+  conditions     VARCHAR2(4000) CHECK (conditions IS JSON),
+  CONSTRAINT ck_promo_date CHECK (valid_to >= valid_from)
+);
+
+-- 8) BOOKING â€” phá»¥ thuá»™c CUSTOMER, SHOWTIME
+CREATE TABLE booking (
+  booking_id      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id     NUMBER NOT NULL REFERENCES customer(customer_id),
+  showtime_id     NUMBER NOT NULL REFERENCES showtime(showtime_id),
+  promo_code      VARCHAR2(30),
+  subtotal        NUMBER,
+  discount_amount NUMBER,
+  final_amount    NUMBER,
+  status          VARCHAR2(10) DEFAULT 'PENDING' NOT NULL
+                  CHECK (status IN ('PENDING','PAID','CANCELLED','EXPIRED')),
+  created_at      TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+  expires_at      TIMESTAMP,
+  paid_at         TIMESTAMP
+);
+
+-- 9) SHOWTIME_SEAT â€” báº£ng trung tÃ¢m chá»‘ng bÃ¡n trÃ¹ng gháº¿ (má»¥c 3.1 bÃ¡o cÃ¡o)
+--    ChÃº Ã½: booking_id KHÃ”NG Ä‘áº·t FOREIGN KEY tá»›i BOOKING â€” Ä‘á»ƒ trÃ¡nh vÃ²ng
+--    phá»¥ thuá»™c (BOOKING cÅ©ng tham chiáº¿u SHOWTIME), quan há»‡ nÃ y Ä‘Æ°á»£c kiá»ƒm
+--    soÃ¡t hoÃ n toÃ n trong PL/SQL cá»§a pkg_booking.
+CREATE TABLE showtime_seat (
+  showtime_id     NUMBER NOT NULL REFERENCES showtime(showtime_id),
+  seat_id         NUMBER NOT NULL REFERENCES seat(seat_id),
+  status          VARCHAR2(10) DEFAULT 'AVAILABLE' NOT NULL
+                  CHECK (status IN ('AVAILABLE','HELD','SOLD')),
+  held_by         NUMBER REFERENCES customer(customer_id),
+  hold_expires_at TIMESTAMP,
+  booking_id      NUMBER,
+  CONSTRAINT pk_showtime_seat PRIMARY KEY (showtime_id, seat_id),
+  CONSTRAINT ck_hold CHECK (status <> 'HELD'
+                            OR (held_by IS NOT NULL AND hold_expires_at IS NOT NULL))
+);
+
+-- 10) TICKET â€” phá»¥ thuá»™c BOOKING vÃ  SHOWTIME_SEAT (khoÃ¡ ngoáº¡i tá»• há»£p)
+CREATE TABLE ticket (
+  ticket_id   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  booking_id  NUMBER NOT NULL REFERENCES booking(booking_id),
+  showtime_id NUMBER NOT NULL,
+  seat_id     NUMBER NOT NULL,
+  price       NUMBER(10) NOT NULL CHECK (price >= 0),
+  CONSTRAINT uq_ticket_seat UNIQUE (showtime_id, seat_id),
+  CONSTRAINT fk_ticket_ss FOREIGN KEY (showtime_id, seat_id)
+    REFERENCES showtime_seat(showtime_id, seat_id)
+);
+
+-- 11) PAYMENT â€” phá»¥ thuá»™c BOOKING
+CREATE TABLE payment (
+  payment_id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  booking_id NUMBER NOT NULL REFERENCES booking(booking_id),
+  method     VARCHAR2(20) NOT NULL,
+  amount     NUMBER NOT NULL,
+  status     VARCHAR2(20) NOT NULL CHECK (status IN ('SUCCESS','FAILED','REFUNDED')),
+  paid_at    TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+-- 12) AUDIT_LOG â€” Ä‘á»™c láº­p, do trigger tá»± ghi (má»¥c 3.11.c bÃ¡o cÃ¡o)
+CREATE TABLE audit_log (
+  log_id     NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  table_name VARCHAR2(30), record_id NUMBER, action VARCHAR2(20),
+  old_value  VARCHAR2(50), new_value VARCHAR2(50),
+  changed_by VARCHAR2(128) DEFAULT SYS_CONTEXT('USERENV', 'SESSION_USER'),
+  changed_at TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+COMMIT;
+
+-- ============================================================
+-- 02_functions_pricing.sql
+-- Hai hÃ m tÃ­nh giÃ¡ Ä‘á»™c láº­p (má»¥c 3.2, 3.3 bÃ¡o cÃ¡o). Pháº£i táº¡o TRÆ¯á»šC
+-- package pkg_booking vÃ¬ sp_confirm_booking sáº½ gá»i hai hÃ m nÃ y.
+-- ============================================================
+
+-- 3.2. HÃ m tÃ­nh giÃ¡ vÃ©
+CREATE OR REPLACE FUNCTION fn_calc_ticket_price(
+  p_showtime_id NUMBER, p_seat_id NUMBER) RETURN NUMBER IS
+  -- Khai bÃ¡o kiá»ƒu dá»¯ liá»‡u cá»¥ thá»ƒ cho tá»«ng biáº¿n (khÃ´ng dÃ¹ng %TYPE)
+  v_base  NUMBER;
+  v_start TIMESTAMP;
+  v_type  VARCHAR2(10);
+  v_price NUMBER;
+BEGIN
+  -- BÆ°á»›c 1: láº¥y giÃ¡ cÆ¡ sá»Ÿ cá»§a suáº¥t chiáº¿u vÃ  loáº¡i gháº¿
+  SELECT st.base_price, st.start_time, s.seat_type
+    INTO v_base, v_start, v_type
+    FROM showtime st, seat s
+   WHERE st.showtime_id = p_showtime_id AND s.seat_id = p_seat_id;
+
+  -- BÆ°á»›c 2: nhÃ¢n há»‡ sá»‘ theo loáº¡i gháº¿ (gháº¿ thÆ°á»ng x1, VIP x1.25, COUPLE x2)
+  v_price := v_base * CASE v_type WHEN 'VIP' THEN 1.25
+                                  WHEN 'COUPLE' THEN 2.0 ELSE 1 END;
+
+  -- BÆ°á»›c 3: cá»™ng thÃªm phá»¥ thu náº¿u suáº¥t chiáº¿u rÆ¡i vÃ o thá»© Báº£y/Chá»§ Nháº­t
+  IF TO_CHAR(v_start, 'DY', 'NLS_DATE_LANGUAGE=ENGLISH') IN ('SAT','SUN') THEN
+    v_price := v_price * 1.15;          -- phá»¥ thu cuá»‘i tuáº§n 15%
+  END IF;
+
+  -- BÆ°á»›c 4: giáº£m giÃ¡ náº¿u lÃ  suáº¥t chiáº¿u buá»•i sÃ¡ng sá»›m (trÆ°á»›c 12 giá» trÆ°a)
+  IF EXTRACT(HOUR FROM v_start) < 12 THEN
+    v_price := v_price * 0.8;           -- suáº¥t sá»›m giáº£m 20%
+  END IF;
+
+  RETURN ROUND(v_price, -3);            -- lÃ m trÃ²n Ä‘áº¿n nghÃ¬n Ä‘á»“ng
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RAISE_APPLICATION_ERROR(-20001, 'Suáº¥t chiáº¿u hoáº·c gháº¿ khÃ´ng tá»“n táº¡i');
+END;
+/
+
+-- 3.3. HÃ m tÃ­nh khuyáº¿n mÃ£i
+CREATE OR REPLACE FUNCTION fn_calc_discount(
+  p_code VARCHAR2, p_subtotal NUMBER, p_showtime_id NUMBER) RETURN NUMBER IS
+  -- Khai bÃ¡o riÃªng tá»«ng biáº¿n vá»›i kiá»ƒu dá»¯ liá»‡u cá»¥ thá»ƒ (khÃ´ng gá»™p chung vÃ o %ROWTYPE)
+  v_valid_from     DATE;
+  v_valid_to       DATE;
+  v_max_uses       NUMBER;
+  v_used_count     NUMBER;
+  v_min_amount     NUMBER;
+  v_discount_type  VARCHAR2(10);
+  v_discount_value NUMBER;
+  v_max_discount   NUMBER;
+  v_conditions     VARCHAR2(4000);  -- cá»™t JSON Ä‘Æ°á»£c lÆ°u dÆ°á»›i dáº¡ng chuá»—i kÃ½ tá»±
+  v_dow    VARCHAR2(3);     -- thá»© trong tuáº§n cá»§a suáº¥t chiáº¿u, vÃ­ dá»¥ 'TUE'
+  v_days   VARCHAR2(200);   -- ná»™i dung JSON "days" dáº¡ng chuá»—i, vÃ­ dá»¥ ["TUE","WED"]
+  v_disc   NUMBER;
+BEGIN
+  -- KhÃ´ng nháº­p mÃ£ thÃ¬ khÃ´ng giáº£m, khá»i cáº§n kiá»ƒm tra gÃ¬ thÃªm
+  IF p_code IS NULL THEN RETURN 0; END IF;
+
+  -- BÆ°á»›c 1: láº¥y tá»«ng cá»™t cáº§n dÃ¹ng cá»§a mÃ£ khuyáº¿n mÃ£i ra tá»«ng biáº¿n riÃªng
+  -- (náº¿u khÃ´ng tÃ¬m tháº¥y mÃ£ sáº½ rÆ¡i vÃ o NO_DATA_FOUND)
+  SELECT valid_from, valid_to, max_uses, used_count, min_amount,
+         discount_type, discount_value, max_discount, conditions
+    INTO v_valid_from, v_valid_to, v_max_uses, v_used_count, v_min_amount,
+         v_discount_type, v_discount_value, v_max_discount, v_conditions
+    FROM promotion WHERE code = UPPER(p_code) AND is_active = 1;
+
+  -- BÆ°á»›c 2: kiá»ƒm tra cÃ¡c Ä‘iá»u kiá»‡n cÆ¡ báº£n cá»§a mÃ£
+  IF SYSDATE NOT BETWEEN v_valid_from AND v_valid_to THEN
+    RAISE_APPLICATION_ERROR(-20030, 'MÃ£ khuyáº¿n mÃ£i Ä‘Ã£ háº¿t háº¡n');
+  ELSIF v_max_uses IS NOT NULL AND v_used_count >= v_max_uses THEN
+    RAISE_APPLICATION_ERROR(-20031, 'MÃ£ khuyáº¿n mÃ£i Ä‘Ã£ háº¿t lÆ°á»£t dÃ¹ng');
+  ELSIF p_subtotal < NVL(v_min_amount, 0) THEN
+    RAISE_APPLICATION_ERROR(-20032, 'ChÆ°a Ä‘áº¡t giÃ¡ trá»‹ Ä‘Æ¡n tá»‘i thiá»ƒu');
+  END IF;
+
+  -- BÆ°á»›c 3: kiá»ƒm tra Ä‘iá»u kiá»‡n "chá»‰ Ã¡p dá»¥ng má»™t sá»‘ ngÃ y trong tuáº§n"
+  -- (Ä‘iá»u kiá»‡n nÃ y lÆ°u trong cá»™t JSON conditions, vÃ­ dá»¥ {"days":["TUE","WED"]})
+  IF v_conditions IS NOT NULL AND JSON_EXISTS(v_conditions, '$.days') THEN
+    SELECT TO_CHAR(start_time, 'DY', 'NLS_DATE_LANGUAGE=ENGLISH')
+      INTO v_dow FROM showtime WHERE showtime_id = p_showtime_id;
+
+    -- Chuyá»ƒn cá»¥c JSON thÃ nh chuá»—i kÃ½ tá»± rá»“i tÃ¬m xem cÃ³ chá»©a Ä‘Ãºng
+    -- mÃ£ 3 kÃ½ tá»± cá»§a ngÃ y chiáº¿u hay khÃ´ng (vÃ­ dá»¥ tÃ¬m "TUE" trong chuá»—i)
+    v_days := JSON_SERIALIZE(v_conditions RETURNING VARCHAR2(200));
+    IF INSTR(v_days, '"' || v_dow || '"') = 0 THEN
+      RAISE_APPLICATION_ERROR(-20033, 'MÃ£ khÃ´ng Ã¡p dá»¥ng cho ngÃ y chiáº¿u nÃ y');
+    END IF;
+  END IF;
+
+  -- BÆ°á»›c 4: tÃ­nh sá»‘ tiá»n giáº£m theo loáº¡i khuyáº¿n mÃ£i, cháº·n tráº§n max_discount
+  v_disc := CASE v_discount_type WHEN 'PERCENT'
+              THEN p_subtotal * v_discount_value / 100
+              ELSE v_discount_value END;
+  IF v_max_discount IS NOT NULL THEN v_disc := LEAST(v_disc, v_max_discount); END IF;
+  RETURN LEAST(ROUND(v_disc, -3), p_subtotal);
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RAISE_APPLICATION_ERROR(-20034, 'MÃ£ khuyáº¿n mÃ£i khÃ´ng tá»“n táº¡i');
+END;
+/
+
+-- ============================================================
+-- 03_package_pkg_booking.sql
+-- Package pkg_booking: toÃ n bá»™ nghiá»‡p vá»¥ Ä‘áº·t vÃ© (má»¥c 3.4â€“3.7, 3.11.b,
+-- 3.11.d bÃ¡o cÃ¡o). Cháº¡y SPEC trÆ°á»›c, BODY sau.
+-- ============================================================
+
+-- ---------- SPECIFICATION ----------
+CREATE OR REPLACE PACKAGE pkg_booking IS
+  PROCEDURE sp_hold_seats(
+    p_customer_id IN NUMBER, p_showtime_id IN NUMBER,
+    p_seat_ids IN SYS.ODCINUMBERLIST, p_booking_id OUT NUMBER
+  );
+
+  PROCEDURE sp_confirm_booking(
+    p_booking_id IN NUMBER, p_promo_code IN VARCHAR2, p_method IN VARCHAR2
+  );
+
+  PROCEDURE sp_cancel_booking(
+    p_booking_id IN NUMBER, p_customer_id IN NUMBER
+  );
+
+  PROCEDURE sp_release_expired_holds;
+  PROCEDURE sp_daily_revenue_report(p_date IN DATE DEFAULT TRUNC(SYSDATE));
+
+  FUNCTION fn_check_room_overlap(
+    p_room_id NUMBER, p_start TIMESTAMP, p_end TIMESTAMP,
+    p_exclude_id NUMBER DEFAULT NULL) RETURN NUMBER;
+
+  PROCEDURE sp_add_showtime(
+    p_movie_id NUMBER, p_room_id NUMBER, p_start TIMESTAMP, p_end TIMESTAMP,
+    p_base_price NUMBER, p_showtime_id OUT NUMBER);
+END pkg_booking;
+/
+
+-- ---------- BODY ----------
+CREATE OR REPLACE PACKAGE BODY pkg_booking IS
+
+  -- 3.4. Giá»¯ chá»— táº¡m thá»i
+  PROCEDURE sp_hold_seats(
+    p_customer_id IN NUMBER, p_showtime_id IN NUMBER,
+    p_seat_ids IN SYS.ODCINUMBERLIST, p_booking_id OUT NUMBER) IS
+    c_hold_minutes CONSTANT NUMBER := 10;
+    v_expire TIMESTAMP := SYSTIMESTAMP + NUMTODSINTERVAL(c_hold_minutes, 'MINUTE');
+    v_start TIMESTAMP; v_status VARCHAR2(10);
+  BEGIN
+    -- BÆ°á»›c 1: cháº·n Ä‘áº·t suáº¥t Ä‘Ã£ Ä‘Ã³ng bÃ¡n hoáº·c Ä‘Ã£ báº¯t Ä‘áº§u chiáº¿u
+    SELECT start_time, status INTO v_start, v_status
+      FROM showtime WHERE showtime_id = p_showtime_id;
+    IF v_status <> 'OPEN' OR v_start <= SYSTIMESTAMP THEN
+      RAISE_APPLICATION_ERROR(-20012, 'Suáº¥t chiáº¿u Ä‘Ã£ Ä‘Ã³ng bÃ¡n');
+    END IF;
+
+    -- BÆ°á»›c 2: kiá»ƒm tra sá»‘ lÆ°á»£ng gháº¿ há»£p lá»‡ (1 Ä‘áº¿n 8 gháº¿ má»™t Ä‘Æ¡n)
+    IF p_seat_ids IS NULL OR p_seat_ids.COUNT NOT BETWEEN 1 AND 8 THEN
+      RAISE_APPLICATION_ERROR(-20010, 'Má»—i Ä‘Æ¡n Ä‘áº·t tá»« 1 Ä‘áº¿n 8 gháº¿');
+    END IF;
+
+    -- BÆ°á»›c 3: Ä‘Ã¡nh dáº¥u Ä‘iá»ƒm má»‘c Ä‘á»ƒ cÃ³ thá»ƒ hoÃ n tÃ¡c (ROLLBACK TO) náº¿u má»™t
+    -- gháº¿ nÃ o Ä‘Ã³ bá»‹ trÃ¹ng á»Ÿ giá»¯a chá»«ng, thay vÃ¬ pháº£i huá»· luÃ´n toÃ n bá»™ giao dá»‹ch
+    SAVEPOINT sp_start;
+
+    -- BÆ°á»›c 4: táº¡o má»™t Ä‘Æ¡n Ä‘áº·t vÃ© má»›i á»Ÿ tráº¡ng thÃ¡i PENDING (Ä‘ang chá» thanh toÃ¡n)
+    INSERT INTO booking(customer_id, showtime_id, status, expires_at)
+    VALUES (p_customer_id, p_showtime_id, 'PENDING', v_expire)
+    RETURNING booking_id INTO p_booking_id;
+
+    -- BÆ°á»›c 5: láº§n lÆ°á»£t giá»¯ tá»«ng gháº¿ trong danh sÃ¡ch p_seat_ids.
+    -- TABLE(p_seat_ids) biáº¿n táº­p há»£p sá»‘ thÃ nh má»™t "báº£ng áº£o" Ä‘á»ƒ duyá»‡t báº±ng FOR,
+    -- giá»‘ng nhÆ° duyá»‡t qua tá»«ng pháº§n tá»­ cá»§a má»™t máº£ng.
+    FOR r IN (SELECT column_value AS seat_id FROM TABLE(p_seat_ids) ORDER BY 1) LOOP
+      -- Chá»‰ UPDATE khi gháº¿ Ä‘ang trá»‘ng, hoáº·c Ä‘ang bá»‹ giá»¯ nhÆ°ng Ä‘Ã£ quÃ¡ háº¡n
+      UPDATE showtime_seat
+         SET status = 'HELD', held_by = p_customer_id,
+             hold_expires_at = v_expire, booking_id = p_booking_id
+       WHERE showtime_id = p_showtime_id AND seat_id = r.seat_id
+         AND (status = 'AVAILABLE'
+              OR (status = 'HELD' AND hold_expires_at < SYSTIMESTAMP));
+      -- KhÃ´ng cÃ³ dÃ²ng nÃ o Ä‘Æ°á»£c cáº­p nháº­t nghÄ©a lÃ  gháº¿ Ä‘Ã£ bá»‹ ngÆ°á»i khÃ¡c giá»¯/bÃ¡n
+      IF SQL%ROWCOUNT = 0 THEN
+        ROLLBACK TO sp_start;   -- tráº£ toÃ n bá»™ Ä‘Æ¡n vá» tráº¡ng thÃ¡i ban Ä‘áº§u
+        RAISE_APPLICATION_ERROR(-20011,
+          'Gháº¿ ' || r.seat_id || ' Ä‘Ã£ cÃ³ ngÆ°á»i giá»¯ hoáº·c Ä‘Ã£ bÃ¡n');
+      END IF;
+    END LOOP;
+    COMMIT;   -- má»i gháº¿ Ä‘á»u giá»¯ thÃ nh cÃ´ng má»›i COMMIT
+  END sp_hold_seats;
+
+  -- 3.5. XÃ¡c nháº­n thanh toÃ¡n
+  PROCEDURE sp_confirm_booking(
+    p_booking_id IN NUMBER, p_promo_code IN VARCHAR2, p_method IN VARCHAR2, p_combos     IN VARCHAR2 DEFAULT NULL) IS
+    -- Khai bÃ¡o riÃªng tá»«ng cá»™t cáº§n dÃ¹ng cá»§a Ä‘Æ¡n Ä‘áº·t vÃ© (khÃ´ng dÃ¹ng %ROWTYPE)
+    v_status      VARCHAR2(10);
+    v_expires_at  TIMESTAMP;
+    v_showtime_id NUMBER;
+    v_total NUMBER; v_cnt NUMBER;
+    v_subtotal NUMBER; v_discount NUMBER;
+  BEGIN
+    -- BÆ°á»›c 1: khoÃ¡ dÃ²ng Ä‘Æ¡n Ä‘áº·t láº¡i (FOR UPDATE) Ä‘á»ƒ khÃ´ng ai báº¥m thanh toÃ¡n
+    -- trÃ¹ng láº·p cho cÃ¹ng má»™t Ä‘Æ¡n, rá»“i kiá»ƒm tra Ä‘Æ¡n cÃ²n hiá»‡u lá»±c khÃ´ng
+    SELECT status, expires_at, showtime_id
+      INTO v_status, v_expires_at, v_showtime_id
+      FROM booking WHERE booking_id = p_booking_id FOR UPDATE;
+    IF v_status <> 'PENDING' OR v_expires_at < SYSTIMESTAMP THEN
+      RAISE_APPLICATION_ERROR(-20020, 'ÄÆ¡n khÃ´ng cÃ²n hiá»‡u lá»±c');
+    END IF;
+
+    -- BÆ°á»›c 2: táº¡o vÃ© (ticket) cho tá»«ng gháº¿ Ä‘ang HELD vÃ  cÃ²n háº¡n giá»¯ chá»—,
+    -- giÃ¡ má»—i vÃ© Ä‘Æ°á»£c tÃ­nh ngay báº±ng hÃ m fn_calc_ticket_price
+    SELECT COUNT(*) INTO v_total FROM showtime_seat WHERE booking_id = p_booking_id;
+
+    INSERT INTO ticket(booking_id, showtime_id, seat_id, price)
+    SELECT booking_id, showtime_id, seat_id, fn_calc_ticket_price(showtime_id, seat_id)
+      FROM showtime_seat
+     WHERE booking_id = p_booking_id AND status = 'HELD'
+       AND hold_expires_at >= SYSTIMESTAMP;
+    v_cnt := SQL%ROWCOUNT;
+    -- Náº¿u sá»‘ vÃ© táº¡o Ä‘Æ°á»£c Ã­t hÆ¡n sá»‘ gháº¿ Ä‘Ã£ giá»¯, nghÄ©a lÃ  cÃ³ gháº¿ bá»‹ háº¿t háº¡n giá»¯a chá»«ng
+    IF v_cnt = 0 OR v_cnt <> v_total THEN
+      RAISE_APPLICATION_ERROR(-20021, 'CÃ³ gháº¿ Ä‘Ã£ háº¿t háº¡n giá»¯ chá»—');
+    END IF;
+
+    -- BÆ°á»›c 3: tÃ­nh tá»•ng tiá»n vÃ  sá»‘ tiá»n Ä‘Æ°á»£c giáº£m (náº¿u cÃ³ mÃ£ khuyáº¿n mÃ£i)
+    SELECT SUM(price) INTO v_subtotal FROM ticket WHERE booking_id = p_booking_id;
+    v_discount := fn_calc_discount(p_promo_code, v_subtotal, v_showtime_id);
+
+    -- BÆ°á»›c 4: náº¿u cÃ³ giáº£m giÃ¡ thÃ¬ tÄƒng used_count cá»§a mÃ£ lÃªn 1,
+    -- nhÆ°ng chá»‰ tÄƒng khi used_count váº«n cÃ²n dÆ°á»›i max_uses (trÃ¡nh vÆ°á»£t quÃ¡)
+    IF v_discount > 0 THEN
+      UPDATE promotion SET used_count = used_count + 1
+       WHERE code = UPPER(p_promo_code)
+         AND (max_uses IS NULL OR used_count < max_uses);
+      IF SQL%ROWCOUNT = 0 THEN
+        RAISE_APPLICATION_ERROR(-20031, 'MÃ£ khuyáº¿n mÃ£i Ä‘Ã£ háº¿t lÆ°á»£t dÃ¹ng');
+      END IF;
+    END IF;
+
+    -- BÆ°á»›c 5: chuyá»ƒn gháº¿ sang SOLD, chuyá»ƒn Ä‘Æ¡n sang PAID, ghi nháº­n thanh toÃ¡n.
+    -- ToÃ n bá»™ 5 bÆ°á»›c náº±m trong má»™t giao dá»‹ch duy nháº¥t nhá» chá»‰ COMMIT á»Ÿ cuá»‘i cÃ¹ng.
+    UPDATE showtime_seat SET status = 'SOLD', held_by = NULL, hold_expires_at = NULL
+     WHERE booking_id = p_booking_id;
+    UPDATE booking SET subtotal = v_subtotal, discount_amount = v_discount,
+           final_amount = v_subtotal - v_discount, promo_code = UPPER(p_promo_code),
+           status = 'PAID', paid_at = SYSTIMESTAMP
+     WHERE booking_id = p_booking_id;
+    INSERT INTO payment(booking_id, method, amount, status, paid_at)
+    VALUES (p_booking_id, p_method, v_subtotal - v_discount, 'SUCCESS', SYSTIMESTAMP);
+    COMMIT;
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;   -- cÃ³ lá»—i á»Ÿ báº¥t ká»³ bÆ°á»›c nÃ o thÃ¬ huá»· háº¿t, khÃ´ng Ä‘á»ƒ dá»¯ liá»‡u ná»­a vá»i
+      RAISE;
+  END sp_confirm_booking;
+
+  -- 3.6. Giáº£i phÃ³ng gháº¿ giá»¯ quÃ¡ háº¡n (Ä‘Æ°á»£c DBMS_SCHEDULER gá»i má»—i phÃºt)
+  PROCEDURE sp_release_expired_holds IS
+  BEGIN
+    UPDATE showtime_seat
+       SET status = 'AVAILABLE', held_by = NULL, hold_expires_at = NULL, booking_id = NULL
+     WHERE status = 'HELD' AND hold_expires_at < SYSTIMESTAMP;
+    UPDATE booking SET status = 'EXPIRED'
+     WHERE status = 'PENDING' AND expires_at < SYSTIMESTAMP;
+    COMMIT;
+  END sp_release_expired_holds;
+
+  -- 3.7. BÃ¡o cÃ¡o doanh thu cuá»‘i ngÃ y â€” Con trá» tÆ°á»ng minh (Explicit Cursor)
+  PROCEDURE sp_daily_revenue_report(p_date IN DATE DEFAULT TRUNC(SYSDATE)) IS
+    -- Khai bÃ¡o con trá» tÆ°á»ng minh
+    CURSOR c_revenue IS
+      SELECT m.title, COUNT(*) AS tickets_sold, SUM(t.price) AS revenue
+        FROM ticket t
+        JOIN booking  b  ON b.booking_id = t.booking_id AND b.status = 'PAID'
+        JOIN showtime st ON st.showtime_id = t.showtime_id
+        JOIN movie    m  ON m.movie_id = st.movie_id
+       WHERE TRUNC(b.paid_at) = p_date
+       GROUP BY m.title
+       ORDER BY SUM(t.price) DESC;
+
+    -- Khai bÃ¡o riÃªng tá»«ng biáº¿n tÆ°Æ¡ng á»©ng vá»›i tá»«ng cá»™t cursor tráº£ vá» (khÃ´ng dÃ¹ng %ROWTYPE)
+    v_title        VARCHAR2(200);
+    v_tickets_sold NUMBER;
+    v_revenue      NUMBER;
+    v_total_rev NUMBER := 0;
+    v_total_tkt NUMBER := 0;
+  BEGIN
+    DBMS_OUTPUT.PUT_LINE('BAO CAO DOANH THU NGAY ' || TO_CHAR(p_date, 'DD/MM/YYYY'));
+    DBMS_OUTPUT.PUT_LINE(RPAD('Phim', 35) || LPAD('So ve', 10) || LPAD('Doanh thu', 15));
+
+    OPEN c_revenue;                      -- má»Ÿ con trá»
+    LOOP
+      FETCH c_revenue INTO v_title, v_tickets_sold, v_revenue;  -- láº¥y tá»«ng dÃ²ng
+      EXIT WHEN c_revenue%NOTFOUND;      -- háº¿t dÃ²ng thÃ¬ dá»«ng
+
+      DBMS_OUTPUT.PUT_LINE(RPAD(v_title, 35)
+                            || LPAD(v_tickets_sold, 10)
+                            || LPAD(TO_CHAR(v_revenue, '999,999,999'), 15));
+      v_total_rev := v_total_rev + v_revenue;
+      v_total_tkt := v_total_tkt + v_tickets_sold;
+    END LOOP;
+    CLOSE c_revenue;                     -- Ä‘Ã³ng con trá»
+
+    DBMS_OUTPUT.PUT_LINE(RPAD('TONG CONG', 35) || LPAD(v_total_tkt, 10)
+                          || LPAD(TO_CHAR(v_total_rev, '999,999,999'), 15));
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF c_revenue%ISOPEN THEN CLOSE c_revenue; END IF;  -- trÃ¡nh rÃ² rá»‰ con trá» khi lá»—i
+      RAISE;
+  END sp_daily_revenue_report;
+
+  -- 3.11.b. Huá»· Ä‘Æ¡n vÃ  hoÃ n vÃ©
+  PROCEDURE sp_cancel_booking(p_booking_id IN NUMBER, p_customer_id IN NUMBER) IS
+    -- Khai bÃ¡o riÃªng tá»«ng cá»™t cáº§n dÃ¹ng cá»§a Ä‘Æ¡n Ä‘áº·t vÃ© (khÃ´ng dÃ¹ng %ROWTYPE/%TYPE)
+    v_bk_customer_id NUMBER;
+    v_status         VARCHAR2(10);
+    v_showtime_id    NUMBER;
+    v_promo_code     VARCHAR2(30);
+    v_final_amount   NUMBER;
+    v_start          TIMESTAMP;
+  BEGIN
+    -- BÆ°á»›c 1: khoÃ¡ dÃ²ng Ä‘Æ¡n, kiá»ƒm tra Ä‘Ãºng chá»§ Ä‘Æ¡n vÃ  Ä‘Ãºng tráº¡ng thÃ¡i Ä‘Æ°á»£c phÃ©p huá»·
+    SELECT customer_id, status, showtime_id, promo_code, final_amount
+      INTO v_bk_customer_id, v_status, v_showtime_id, v_promo_code, v_final_amount
+      FROM booking WHERE booking_id = p_booking_id FOR UPDATE;
+    IF v_bk_customer_id <> p_customer_id THEN
+      RAISE_APPLICATION_ERROR(-20040, 'Khong co quyen huy don nay');
+    ELSIF v_status NOT IN ('PENDING', 'PAID') THEN
+      RAISE_APPLICATION_ERROR(-20041, 'Don khong the huy o trang thai hien tai');
+    END IF;
+
+    -- BÆ°á»›c 2: náº¿u Ä‘Æ¡n Ä‘Ã£ thanh toÃ¡n (PAID) thÃ¬ pháº£i hoÃ n tiá»n vÃ  xoÃ¡ vÃ©,
+    -- nhÆ°ng chá»‰ Ä‘Æ°á»£c huá»· khi cÃ²n Ã­t nháº¥t 2 giá» trÆ°á»›c giá» chiáº¿u
+    IF v_status = 'PAID' THEN
+      SELECT start_time INTO v_start FROM showtime WHERE showtime_id = v_showtime_id;
+      IF v_start < SYSTIMESTAMP + INTERVAL '2' HOUR THEN
+        RAISE_APPLICATION_ERROR(-20042, 'Chi huy ve da thanh toan truoc gio chieu it nhat 2 gio');
+      END IF;
+      DELETE FROM ticket WHERE booking_id = p_booking_id;   -- xoÃ¡ vÃ© trÆ°á»›c
+      INSERT INTO payment(booking_id, method, amount, status, paid_at)
+      VALUES (p_booking_id, 'REFUND', -v_final_amount, 'REFUNDED', SYSTIMESTAMP);
+      IF v_promo_code IS NOT NULL THEN
+        UPDATE promotion SET used_count = GREATEST(used_count - 1, 0)
+         WHERE code = v_promo_code;
+      END IF;
+    END IF;
+
+    -- BÆ°á»›c 3: tráº£ gháº¿ vá» trá»‘ng vÃ  chuyá»ƒn Ä‘Æ¡n sang CANCELLED
+    -- (náº¿u Ä‘Æ¡n Ä‘ang PENDING thÃ¬ chá»‰ cáº§n lÃ m Ä‘Ãºng bÆ°á»›c nÃ y, bá» qua bÆ°á»›c 2)
+    UPDATE showtime_seat
+       SET status = 'AVAILABLE', held_by = NULL, hold_expires_at = NULL, booking_id = NULL
+     WHERE booking_id = p_booking_id;
+    UPDATE booking SET status = 'CANCELLED' WHERE booking_id = p_booking_id;
+    COMMIT;
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+      RAISE;
+  END sp_cancel_booking;
+
+  -- 3.11.d. Chá»‘ng chá»“ng giá» chiáº¿u trong cÃ¹ng phÃ²ng
+  FUNCTION fn_check_room_overlap(
+    p_room_id NUMBER, p_start TIMESTAMP, p_end TIMESTAMP,
+    p_exclude_id NUMBER DEFAULT NULL) RETURN NUMBER IS
+    v_cnt NUMBER;
+  BEGIN
+    SELECT COUNT(*) INTO v_cnt
+      FROM showtime s
+     WHERE s.room_id = p_room_id
+       AND s.status <> 'CANCELLED'
+       AND (p_exclude_id IS NULL OR s.showtime_id <> p_exclude_id)
+       AND s.start_time < p_end      -- suáº¥t má»›i báº¯t Ä‘áº§u trÆ°á»›c khi suáº¥t cÅ© káº¿t thÃºc
+       AND s.end_time   > p_start;   -- vÃ  káº¿t thÃºc sau khi suáº¥t cÅ© báº¯t Ä‘áº§u
+    RETURN v_cnt;
+  END fn_check_room_overlap;
+
+  PROCEDURE sp_add_showtime(
+    p_movie_id NUMBER, p_room_id NUMBER, p_start TIMESTAMP, p_end TIMESTAMP,
+    p_base_price NUMBER, p_showtime_id OUT NUMBER) IS
+  BEGIN
+    IF fn_check_room_overlap(p_room_id, p_start, p_end) > 0 THEN
+      RAISE_APPLICATION_ERROR(-20050, 'Phong da co suat chieu trung gio');
+    END IF;
+
+    INSERT INTO showtime(movie_id, room_id, start_time, end_time, base_price, status)
+    VALUES (p_movie_id, p_room_id, p_start, p_end, p_base_price, 'OPEN')
+    RETURNING showtime_id INTO p_showtime_id;
+    COMMIT;
+    -- LÆ°u Ã½: trigger trg_showtime_seed (file 04) sáº½ tá»± Ä‘á»™ng cháº¡y ngay sau INSERT
+    -- nÃ y Ä‘á»ƒ sinh sáºµn cÃ¡c dÃ²ng gháº¿ trá»‘ng cho suáº¥t chiáº¿u vá»«a táº¡o.
+  END sp_add_showtime;
+
+END pkg_booking;
+/
+
+-- ============================================================
+-- 04_triggers_job.sql
+-- Trigger tá»± sinh gháº¿ trá»‘ng cho suáº¥t chiáº¿u má»›i (3.6), job dá»n gháº¿
+-- giá»¯ quÃ¡ háº¡n cháº¡y má»—i phÃºt (3.6), trigger ghi nháº­t kÃ½ Ä‘á»•i tráº¡ng thÃ¡i
+-- Ä‘Æ¡n (3.11.c). Cháº¡y SAU khi Ä‘Ã£ cÃ³ pkg_booking (file 03) vÃ¬ job gá»i
+-- tháº³ng pkg_booking.sp_release_expired_holds.
+-- ============================================================
+
+-- 3.6. Tá»± sinh gháº¿ trá»‘ng ngay khi thÃªm má»™t suáº¥t chiáº¿u má»›i
+CREATE OR REPLACE TRIGGER trg_showtime_seed
+AFTER INSERT ON showtime FOR EACH ROW
+BEGIN
+  INSERT INTO showtime_seat(showtime_id, seat_id)
+  SELECT :NEW.showtime_id, seat_id FROM seat WHERE room_id = :NEW.room_id;
+END;
+/
+
+-- 3.6. Job cháº¡y má»—i phÃºt Ä‘á»ƒ giáº£i phÃ³ng gháº¿ giá»¯ quÃ¡ háº¡n
+BEGIN
+  -- XoÃ¡ job cÅ© náº¿u lá»¡ cháº¡y file nÃ y hai láº§n, trÃ¡nh lá»—i "job Ä‘Ã£ tá»“n táº¡i"
+  BEGIN
+    DBMS_SCHEDULER.DROP_JOB('JOB_RELEASE_HOLDS', force => TRUE);
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+
+  DBMS_SCHEDULER.CREATE_JOB(
+    job_name        => 'JOB_RELEASE_HOLDS',
+    job_type        => 'PLSQL_BLOCK',
+    job_action      => 'BEGIN pkg_booking.sp_release_expired_holds; END;',
+    repeat_interval => 'FREQ=MINUTELY;INTERVAL=1',
+    enabled         => TRUE);
+END;
+/
+
+-- 3.11.c. Nháº­t kÃ½ Ä‘á»•i tráº¡ng thÃ¡i Ä‘Æ¡n
+CREATE OR REPLACE TRIGGER trg_booking_audit
+AFTER UPDATE OF status ON booking FOR EACH ROW
+WHEN (OLD.status <> NEW.status)
+BEGIN
+  INSERT INTO audit_log(table_name, record_id, action, old_value, new_value)
+  VALUES ('BOOKING', :NEW.booking_id, 'STATUS_CHANGE', :OLD.status, :NEW.status);
+END;
+/
+
+-- ============================================================
+-- 05_mle_password.sql
+-- HÃ m MLE (JavaScript) kiá»ƒm tra Ä‘á»™ máº¡nh máº­t kháº©u (má»¥c 3.8 bÃ¡o cÃ¡o).
+-- Náº¿u Oracle bÃ¡o thiáº¿u quyá»n táº¡o MLE MODULE, xem láº¡i file 00
+-- (DB_DEVELOPER_ROLE Ä‘Ã£ bao gá»“m quyá»n nÃ y trÃªn Oracle 23ai).
+-- ============================================================
+
+-- 1. Táº¡o MLE MODULE chá»©a mÃ£ JavaScript
+CREATE OR REPLACE MLE MODULE mod_password_check
+LANGUAGE JAVASCRIPT AS
+
+export function isStrongPassword(pwd) {
+  if (!pwd || pwd.length < 8) return 0;
+  const hasUpper = /[A-Z]/.test(pwd);
+  const hasLower = /[a-z]/.test(pwd);
+  const hasDigit = /[0-9]/.test(pwd);
+  return (hasUpper && hasLower && hasDigit) ? 1 : 0;
+}
+/
+
+-- 2. Táº¡o Function PL/SQL gá»i hÃ m JavaScript trÃªn qua MLE
+CREATE OR REPLACE FUNCTION fn_is_strong_password(p_password VARCHAR2)
+RETURN NUMBER
+AS MLE MODULE mod_password_check
+SIGNATURE 'isStrongPassword(string)';
+/
+
+-- 3. Sá»­ dá»¥ng trong thá»§ tá»¥c Ä‘Äƒng kÃ½ khÃ¡ch hÃ ng
+CREATE OR REPLACE PROCEDURE sp_register_customer(
+  p_full_name IN VARCHAR2, p_email IN VARCHAR2,
+  p_password  IN VARCHAR2, p_customer_id OUT NUMBER) IS
+BEGIN
+  IF fn_is_strong_password(p_password) = 0 THEN
+    RAISE_APPLICATION_ERROR(-20060,
+      'Mat khau phai co it nhat 8 ky tu, gom chu hoa, chu thuong va so');
+  END IF;
+  INSERT INTO customer(full_name, email, password_hash)
+  VALUES (p_full_name, p_email, STANDARD_HASH(p_password, 'SHA256'))
+  RETURNING customer_id INTO p_customer_id;
+  COMMIT;
+EXCEPTION
+  WHEN DUP_VAL_ON_INDEX THEN
+    RAISE_APPLICATION_ERROR(-20061, 'Email da duoc dang ky');
+END sp_register_customer;
+/
+
+-- ============================================================
+-- 06_views_reports.sql
+-- SÆ¡ Ä‘á»“ gháº¿ cho giao diá»‡n, view + hÃ m thá»‘ng kÃª doanh thu/láº¥p Ä‘áº§y
+-- (má»¥c 3.11.a vÃ  3.11.e bÃ¡o cÃ¡o).
+-- ============================================================
+
+-- 3.11.a. SÆ¡ Ä‘á»“ gháº¿ â€” giao diá»‡n chá»‰ Ä‘á»c view nÃ y, khÃ´ng Ä‘á»c tháº³ng SHOWTIME_SEAT
+CREATE OR REPLACE VIEW v_seat_map AS
+SELECT ss.showtime_id, s.seat_id, s.row_label, s.seat_no, s.seat_type,
+       CASE WHEN ss.status = 'HELD' AND ss.hold_expires_at < SYSTIMESTAMP
+            THEN 'AVAILABLE' ELSE ss.status END AS status
+  FROM showtime_seat ss JOIN seat s ON s.seat_id = ss.seat_id;
+
+-- 3.11.e. Thá»‘ng kÃª doanh thu vÃ  tá»‰ lá»‡ láº¥p Ä‘áº§y (cho quáº£n trá»‹)
+CREATE OR REPLACE VIEW v_revenue_by_movie AS
+SELECT m.movie_id, m.title, TRUNC(st.start_time) AS show_date,
+       COUNT(*) AS tickets_sold, SUM(t.price) AS gross_revenue
+  FROM ticket t
+  JOIN booking  b  ON b.booking_id  = t.booking_id AND b.status = 'PAID'
+  JOIN showtime st ON st.showtime_id = t.showtime_id
+  JOIN movie    m  ON m.movie_id     = st.movie_id
+ GROUP BY m.movie_id, m.title, TRUNC(st.start_time);
+
+CREATE OR REPLACE FUNCTION fn_occupancy_rate(p_showtime_id NUMBER) RETURN NUMBER IS
+  v_rate NUMBER;
+BEGIN
+  SELECT ROUND(100 * COUNT(CASE WHEN status = 'SOLD' THEN 1 END) / NULLIF(COUNT(*), 0), 1)
+    INTO v_rate FROM showtime_seat WHERE showtime_id = p_showtime_id;
+  RETURN NVL(v_rate, 0);
+END;
+/
+
+-- ============================================================
+-- 07_grants.sql  (má»¥c 3.11.f bÃ¡o cÃ¡o â€” khÃ´ng báº¯t buá»™c Ä‘á»ƒ demo cháº¡y Ä‘Æ°á»£c)
+-- Trong Ä‘á»“ Ã¡n nÃ y, schema cinema_app vá»«a lÃ  nÆ¡i sá»Ÿ há»¯u toÃ n bá»™
+-- báº£ng/package (schema owner) vá»«a Ä‘Ã³ng luÃ´n vai trÃ² tÃ i khoáº£n á»©ng
+-- dá»¥ng káº¿t ná»‘i CSDL, nÃªn role bÃªn dÆ°á»›i chá»§ yáº¿u MINH HOáº  mÃ´ hÃ¬nh
+-- phÃ¢n quyá»n "á»©ng dá»¥ng khÃ´ng ghi trá»±c tiáº¿p lÃªn báº£ng, chá»‰ gá»i qua
+-- package" â€” chá»§ owner thÃ¬ máº·c nhiÃªn cÃ³ Ä‘á»§ quyá»n rá»“i nÃªn tá»± cáº¥p cho
+-- chÃ­nh mÃ¬nh khÃ´ng thay Ä‘á»•i gÃ¬ cáº£.
+-- Náº¿u muá»‘n lÃ m Ä‘Ãºng nghÄ©a (vÃ  cÃ³ cÃ¢u tráº£ lá»i cháº¯c hÆ¡n khi váº¥n Ä‘Ã¡p),
+-- cÃ³ thá»ƒ táº¡o thÃªm má»™t user khÃ¡c (vd cinema_web) khÃ´ng sá»Ÿ há»¯u báº£ng,
+-- chá»‰ Ä‘Æ°á»£c CONNECT + cáº¥p Ä‘Ãºng role nÃ y, rá»“i Ä‘á»ƒ á»©ng dá»¥ng web dÃ¹ng
+-- user Ä‘Ã³ thay vÃ¬ user chá»§ schema.
+-- ============================================================
+
+CREATE ROLE cinema_app_role;
+GRANT EXECUTE ON pkg_booking            TO cinema_app_role;
+GRANT EXECUTE ON fn_is_strong_password  TO cinema_app_role;
+GRANT SELECT  ON movie                  TO cinema_app_role;
+GRANT SELECT  ON showtime               TO cinema_app_role;
+GRANT SELECT  ON v_seat_map             TO cinema_app_role;
+GRANT cinema_app_role TO cinema_app;   -- cinema_app: tÃ i khoáº£n á»©ng dá»¥ng
+
+-- ============================================================
+-- 08_seed_data_and_test.sql
+-- Dá»¯ liá»‡u máº«u Ä‘á»ƒ CSDL cÃ³ cÃ¡i mÃ  xem/cháº¡y thá»­ ngay, cá»™ng má»™t Ä‘oáº¡n
+-- test nhanh á»Ÿ cuá»‘i Ä‘á»ƒ chá»©ng minh toÃ n bá»™ luá»“ng (giá»¯ gháº¿ â†’ thanh
+-- toÃ¡n â†’ xem bÃ¡o cÃ¡o doanh thu) cháº¡y Ä‘Ãºng.
+-- Cháº¡y SAU khi Ä‘Ã£ cÃ³ Ä‘á»§ file 01 â†’ 06 (vÃ  07 náº¿u muá»‘n).
+-- ============================================================
+
+-- LÆ°u Ã½ khi cháº¡y báº±ng DBeaver (khÃ¡c SQL Developer/SQLcl):
+-- "SET SERVEROUTPUT ON" lÃ  lá»‡nh riÃªng cá»§a SQL*Plus, DBeaver khÃ´ng hiá»ƒu.
+-- Äá»ƒ tháº¥y Ä‘Æ°á»£c cÃ¡c dÃ²ng DBMS_OUTPUT.PUT_LINE bÃªn dÆ°á»›i, má»Ÿ tab
+-- "Output" / "DBMS Output" trong DBeaver (Window > tÃ¬m "DBMS Output",
+-- hoáº·c icon hÃ¬nh loa á»Ÿ panel dÆ°á»›i cÃ¹ng khi Ä‘ang má»Ÿ SQL Editor) rá»“i báº¥m
+-- nÃºt báº­t (Enable) CHO CHÃNH Káº¾T Ná»I Ä‘ang dÃ¹ng, trÆ°á»›c khi cháº¡y script nÃ y.
+
+-- 1) Ráº¡p vÃ  phÃ²ng chiáº¿u
+INSERT INTO theater(name, address) VALUES ('CGV Demo', '123 ÄÆ°á»ng ABC, Quáº­n 1, TP.HCM');
+
+INSERT INTO room(theater_id, name, room_type)
+SELECT theater_id, 'PhÃ²ng 1', '2D' FROM theater WHERE name = 'CGV Demo';
+INSERT INTO room(theater_id, name, room_type)
+SELECT theater_id, 'PhÃ²ng 2', '3D' FROM theater WHERE name = 'CGV Demo';
+
+-- 2) Gháº¿: má»—i phÃ²ng 5 hÃ ng (Aâ€“E) x 8 gháº¿/hÃ ng.
+--    HÃ ng A,B: STANDARD â€” hÃ ng C,D: VIP â€” hÃ ng E: COUPLE.
+BEGIN
+  FOR r IN (SELECT room_id FROM room) LOOP
+    FOR i IN 1..5 LOOP               -- hÃ ng gháº¿: A=1, B=2, ... E=5
+      FOR j IN 1..8 LOOP             -- sá»‘ gháº¿ trong hÃ ng
+        INSERT INTO seat(room_id, row_label, seat_no, seat_type)
+        VALUES (r.room_id, CHR(64 + i), j,
+                CASE WHEN i <= 2 THEN 'STANDARD'
+                     WHEN i <= 4 THEN 'VIP'
+                     ELSE 'COUPLE' END);
+      END LOOP;
+    END LOOP;
+  END LOOP;
+  COMMIT;
+END;
+/
+
+-- 3) Phim (metadata lÃ  JSON lÆ°u dáº¡ng chuá»—i, Ä‘Ãºng thiáº¿t káº¿ má»¥c 2.6)
+INSERT INTO movie(title, genre, duration_min, rating, release_date, metadata) VALUES
+('Biá»‡t Äá»™i SiÃªu Anh HÃ¹ng', 'HÃ nh Ä‘á»™ng', 130, 'C13', DATE '2026-01-10',
+ '{"director":"Nguyen Van Dao","actors":["Dien Vien A","Dien Vien B"],"language":"Phu de"}');
+INSERT INTO movie(title, genre, duration_min, rating, release_date, metadata) VALUES
+('MÃ¹a HÃ¨ Cá»§a ChÃºng Ta', 'TÃ¢m lÃ½', 105, 'P', DATE '2026-02-01',
+ '{"director":"Tran Thi Hoa","actors":["Dien Vien C"],"language":"Long tieng"}');
+INSERT INTO movie(title, genre, duration_min, rating, release_date, metadata) VALUES
+('VÆ°Æ¡ng Quá»‘c Hoáº¡t HÃ¬nh', 'Hoáº¡t hÃ¬nh', 95, 'P', DATE '2026-03-15',
+ '{"director":"Le Van Binh","actors":["Long tieng Vietnam"],"language":"Long tieng"}');
+COMMIT;
+
+-- 4) Suáº¥t chiáº¿u â€” táº¡o qua pkg_booking.sp_add_showtime Ä‘á»ƒ Ä‘i Ä‘Ãºng luá»“ng
+--    (hÃ m fn_check_room_overlap kiá»ƒm tra trÃ¹ng giá», trigger trg_showtime_seed
+--    tá»± sinh sáºµn gháº¿ trá»‘ng cho tá»«ng suáº¥t vá»«a táº¡o).
+DECLARE
+  v_showtime_id NUMBER;
+  v_ngay_mai    DATE := TRUNC(SYSDATE) + 1;
+  v_movie1 NUMBER; v_movie2 NUMBER; v_movie3 NUMBER;
+  v_room1  NUMBER; v_room2  NUMBER;
+BEGIN
+  SELECT movie_id INTO v_movie1 FROM movie ORDER BY movie_id OFFSET 0 ROWS FETCH NEXT 1 ROW ONLY;
+  SELECT movie_id INTO v_movie2 FROM movie ORDER BY movie_id OFFSET 1 ROWS FETCH NEXT 1 ROW ONLY;
+  SELECT movie_id INTO v_movie3 FROM movie ORDER BY movie_id OFFSET 2 ROWS FETCH NEXT 1 ROW ONLY;
+  SELECT room_id  INTO v_room1  FROM room WHERE name = 'PhÃ²ng 1' ORDER BY room_id FETCH FIRST 1 ROW ONLY;
+  SELECT room_id  INTO v_room2  FROM room WHERE name = 'PhÃ²ng 2' ORDER BY room_id FETCH FIRST 1 ROW ONLY;
+
+  -- Suáº¥t 1: PhÃ²ng 1, 09:00 ngÃ y mai, giÃ¡ cÆ¡ sá»Ÿ 75.000
+  pkg_booking.sp_add_showtime(
+    v_movie1, v_room1,
+    CAST(v_ngay_mai + 9/24 AS TIMESTAMP),
+    CAST(v_ngay_mai + 11.2/24 AS TIMESTAMP),
+    75000, v_showtime_id);
+
+  -- Suáº¥t 2: PhÃ²ng 1, 14:00 ngÃ y mai (khÃ´ng chá»“ng giá» vá»›i suáº¥t 1)
+  pkg_booking.sp_add_showtime(
+    v_movie2, v_room1,
+    CAST(v_ngay_mai + 14/24 AS TIMESTAMP),
+    CAST(v_ngay_mai + 15.75/24 AS TIMESTAMP),
+    65000, v_showtime_id);
+
+  -- Suáº¥t 3: PhÃ²ng 2, 10:00 ngÃ y mai
+  pkg_booking.sp_add_showtime(
+    v_movie3, v_room2,
+    CAST(v_ngay_mai + 10/24 AS TIMESTAMP),
+    CAST(v_ngay_mai + 11.6/24 AS TIMESTAMP),
+    80000, v_showtime_id);
+
+  COMMIT;
+END;
+/
+
+-- 5) KhÃ¡ch hÃ ng â€” Ä‘Äƒng kÃ½ qua sp_register_customer Ä‘á»ƒ Ä‘i qua MLE
+--    kiá»ƒm tra Ä‘á»™ máº¡nh máº­t kháº©u (má»¥c 3.8).
+DECLARE
+  v_customer_id NUMBER;
+BEGIN
+  sp_register_customer('Nguyá»…n VÄƒn An', 'an.nguyen@example.com', 'MatKhau123', v_customer_id);
+  sp_register_customer('Tráº§n Thá»‹ BÃ¬nh', 'binh.tran@example.com', 'MatKhau456', v_customer_id);
+END;
+/
+
+-- 6) MÃ£ khuyáº¿n mÃ£i máº«u
+INSERT INTO promotion(code, discount_type, discount_value, max_discount, min_amount,
+                       valid_from, valid_to, max_uses, used_count, is_active, conditions)
+VALUES ('WELCOME10', 'PERCENT', 10, 50000, 100000,
+        DATE '2026-01-01', DATE '2026-12-31', 100, 0, 1, NULL);
+
+INSERT INTO promotion(code, discount_type, discount_value, max_discount, min_amount,
+                       valid_from, valid_to, max_uses, used_count, is_active, conditions)
+VALUES ('WEEKDAY20', 'PERCENT', 20, 30000, 0,
+        DATE '2026-01-01', DATE '2026-12-31', NULL, 0, 1, '{"days":["MON","TUE","WED"]}');
+COMMIT;
+
+-- ============================================================
+-- 7) TEST NHANH: giá»¯ gháº¿ â†’ xÃ¡c nháº­n thanh toÃ¡n â†’ xem láº¡i
+--    (cháº¡y thá»­ Ä‘á»ƒ tá»± tháº¥y toÃ n bá»™ luá»“ng hoáº¡t Ä‘á»™ng Ä‘Ãºng)
+-- ============================================================
+DECLARE
+  v_showtime_id NUMBER;
+  v_customer_id NUMBER;
+  v_seat1 NUMBER; v_seat2 NUMBER;
+  v_booking_id NUMBER;
+BEGIN
+  SELECT showtime_id INTO v_showtime_id
+    FROM showtime WHERE base_price = 75000 AND ROWNUM = 1;
+  SELECT customer_id INTO v_customer_id
+    FROM customer WHERE email = 'an.nguyen@example.com';
+
+  -- láº¥y 2 gháº¿ STANDARD hÃ ng A cá»§a chÃ­nh phÃ²ng Ä‘ang chiáº¿u suáº¥t trÃªn
+  SELECT seat_id INTO v_seat1 FROM seat
+   WHERE room_id = (SELECT room_id FROM showtime WHERE showtime_id = v_showtime_id)
+     AND row_label = 'A' AND seat_no = 1;
+  SELECT seat_id INTO v_seat2 FROM seat
+   WHERE room_id = (SELECT room_id FROM showtime WHERE showtime_id = v_showtime_id)
+     AND row_label = 'A' AND seat_no = 2;
+
+  -- BÆ°á»›c 1: giá»¯ 2 gháº¿ trong 10 phÃºt
+  pkg_booking.sp_hold_seats(
+    v_customer_id, v_showtime_id,
+    SYS.ODCINUMBERLIST(v_seat1, v_seat2), v_booking_id);
+  DBMS_OUTPUT.PUT_LINE('Da giu cho thanh cong, booking_id = ' || v_booking_id);
+
+  -- BÆ°á»›c 2: xÃ¡c nháº­n thanh toÃ¡n, dÃ¹ng mÃ£ khuyáº¿n mÃ£i WELCOME10
+  pkg_booking.sp_confirm_booking(v_booking_id, 'WELCOME10', 'CREDIT_CARD');
+  DBMS_OUTPUT.PUT_LINE('Da xac nhan thanh toan cho booking_id = ' || v_booking_id);
+END;
+/
+
+-- Xem láº¡i káº¿t quáº£. "PROMPT" vÃ  "EXEC" lÃ  lá»‡nh riÃªng cá»§a SQL*Plus nÃªn
+-- khÃ´ng dÃ¹ng á»Ÿ Ä‘Ã¢y; DBeaver chá»‰ hiá»ƒu SQL/PL-SQL chuáº©n.
+
+-- ===== ThÃ´ng tin Ä‘Æ¡n vá»«a thanh toÃ¡n =====
+SELECT booking_id, status, subtotal, discount_amount, final_amount, promo_code
+  FROM booking ORDER BY booking_id DESC FETCH FIRST 1 ROWS ONLY;
+
+-- ===== SÆ¡ Ä‘á»“ gháº¿ cá»§a suáº¥t chiáº¿u (chá»‰ cÃ¡c gháº¿ khÃ´ng cÃ²n trá»‘ng) =====
+SELECT * FROM v_seat_map WHERE status <> 'AVAILABLE';
+
+-- ===== BÃ¡o cÃ¡o doanh thu theo NGÃ€Y THANH TOÃN (paid_at), khÃ´ng pháº£i
+-- ngÃ y chiáº¿u â€” nÃªn dÃ¹ suáº¥t chiáº¿u lÃ  "ngÃ y mai", Ä‘Æ¡n vá»«a thanh toÃ¡n xong
+-- (paid_at = hÃ´m nay) váº«n xuáº¥t hiá»‡n ngay trong bÃ¡o cÃ¡o cá»§a hÃ´m nay.
+-- Thay "EXEC thu_tuc;" (SQL*Plus) báº±ng khá»‘i PL/SQL thÆ°á»ng:
+BEGIN
+  pkg_booking.sp_daily_revenue_report;
+END;
+/
+
+SELECT * FROM CUSTOMER
+SELECT * FROM REVIEW 
+SELECT * FROM MOVIE 
+
+===== C:\Users\Khai\cinema-booking\thanh-vien.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="thanhvien"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\tin-tuc.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="tintuc"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\uu-dai.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="uudai"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\ve-cua-toi.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="vecuatoi"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
+
+===== C:\Users\Khai\cinema-booking\ve.html =====
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CineDB | Äáº·t vÃ© xem phim trá»±c tuyáº¿n</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css"></head>
+<body data-page="ve"><div id="hdr"></div><main id="app"></main><div id="ftr"></div><div id="toast" class="toast" hidden></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="js/api.js"></script><script src="js/site.js"></script></body></html>
+
