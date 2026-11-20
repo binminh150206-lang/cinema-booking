@@ -406,7 +406,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_booking IS
 
   -- 3.5. Xác nhận thanh toán
   PROCEDURE sp_confirm_booking(
-    p_booking_id IN NUMBER, p_promo_code IN VARCHAR2, p_method IN VARCHAR2, p_combos     IN VARCHAR2 DEFAULT NULL) IS
+    p_booking_id IN NUMBER, p_promo_code IN VARCHAR2, p_method IN VARCHAR2) IS
     -- Khai báo riêng từng cột cần dùng của đơn đặt vé (không dùng %ROWTYPE)
     v_status      VARCHAR2(10);
     v_expires_at  TIMESTAMP;
@@ -546,10 +546,10 @@ CREATE OR REPLACE PACKAGE BODY pkg_booking IS
     END IF;
 
     -- Bước 2: nếu đơn đã thanh toán (PAID) thì phải hoàn tiền và xoá vé,
-    -- nhưng chỉ được huỷ khi còn ít nhất 2 giờ trước giờ chiếu
+    -- nhưng chỉ được huỷ khi còn ít nhất 2 giờ trước giờ chiếu (tính theo giờ Việt Nam UTC+7)
     IF v_status = 'PAID' THEN
       SELECT start_time INTO v_start FROM showtime WHERE showtime_id = v_showtime_id;
-      IF v_start < SYSTIMESTAMP + INTERVAL '2' HOUR THEN
+      IF v_start < CAST(SYSTIMESTAMP AT TIME ZONE '+07:00' AS TIMESTAMP) + INTERVAL '2' HOUR THEN
         RAISE_APPLICATION_ERROR(-20042, 'Chi huy ve da thanh toan truoc gio chieu it nhat 2 gio');
       END IF;
       DELETE FROM ticket WHERE booking_id = p_booking_id;   -- xoá vé trước
@@ -925,3 +925,17 @@ END;
 SELECT * FROM CUSTOMER
 SELECT * FROM REVIEW 
 SELECT * FROM MOVIE 
+SELECT * FROM TICKET
+SELECT * FROM PAYMENT 
+SELECT * FROM PROMOTION 
+SELECT object_name, object_type, status
+  FROM user_objects
+ WHERE object_name = 'PKG_BOOKING';
+
+
+DROP TABLE booking_combo CASCADE CONSTRAINTS;
+DROP TABLE combo CASCADE CONSTRAINTS;
+
+SELECT constraint_name, search_condition
+  FROM user_constraints
+ WHERE constraint_name = 'SYS_C008705';

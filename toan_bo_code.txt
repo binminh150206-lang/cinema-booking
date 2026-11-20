@@ -1745,7 +1745,7 @@ async function aRev(box) {
         .sort((a, b) => b.gross_revenue - a.gross_revenue)
         .map((r, i) => ({ ...r, rnk: i + 1 })),
     );
-  box.innerHTML = `<div class="stats"><div><b>${money(tot)}</b><span>Doanh thu gá»™p</span></div><div><b>${rev.reduce((a, r) => a + Number(r.tickets_sold), 0)}</b><span>VÃ© Ä‘Ã£ bÃ¡n</span></div><div><b>${log.filter((l) => l.new_value === "PAID").length}</b><span>ÄÆ¡n Ä‘Ã£ thanh toÃ¡n</span></div><div><b>${log.filter((l) => ["CANCELLED", "EXPIRED"].includes(l.new_value)).length}</b><span>ÄÆ¡n huá»· hoáº·c háº¿t háº¡n</span></div></div><p><button class="btn alt" id="csv">Xuáº¥t CSV</button> <button class="btn" id="rel">Cháº¡y sp_release_expired_holds</button> <button class="btn alt" id="rst">Äáº·t láº¡i phiÃªn</button></p>
+  box.innerHTML = `<div class="stats"><div><b>${money(tot)}</b><span>Doanh thu gá»™p</span></div><div><b>${rev.reduce((a, r) => a + Number(r.tickets_sold), 0)}</b><span>VÃ© Ä‘Ã£ bÃ¡n</span></div><div><b>${log.filter((l) => l.new_value === "PAID").length}</b><span>ÄÆ¡n Ä‘Ã£ thanh toÃ¡n</span></div><div><b>${log.filter((l) => ["CANCELLED", "EXPIRED"].includes(l.new_value)).length}</b><span>ÄÆ¡n huá»· hoáº·c háº¿t háº¡n</span></div></div><p><button class="btn alt" id="csv">Xuáº¥t CSV</button> <button class="btn" id="rel">Cháº¡y thu hồi ghế hết hạn</button> <button class="btn alt" id="rst">Äáº·t láº¡i phiÃªn</button></p>
   <h3>Doanh thu vÃ  háº¡ng phim theo ngÃ y chiáº¿u</h3><table><tr><th>NgÃ y chiáº¿u</th><th>Háº¡ng</th><th>Phim</th><th>Sá»‘ vÃ©</th><th>Doanh thu gá»™p</th></tr>${rows.map((r) => `<tr><td>${toDate(r.show_date).toLocaleDateString("vi-VN")}</td><td>${r.rnk}</td><td>${r.title}</td><td>${r.tickets_sold}</td><td>${money(r.gross_revenue)}</td></tr>`).join("") || '<tr><td colspan="5">ChÆ°a cÃ³ vÃ© nÃ o Ä‘Æ°á»£c bÃ¡n.</td></tr>'}<tr><td colspan="4"><b>Tá»•ng cá»™ng</b></td><td><b>${money(tot)}</b></td></tr></table>
   <h3>Nháº­t kÃ½ Ä‘á»•i tráº¡ng thÃ¡i Ä‘Æ¡n</h3><table><tr><th>ÄÆ¡n</th><th>Tá»«</th><th>Sang</th><th>LÃºc</th></tr>${log.map((l) => `<tr><td>#${l.record_id}</td><td>${l.old_value}</td><td>${l.new_value}</td><td>${fDate(l.changed_at)} ${fTime(l.changed_at)}</td></tr>`).join("") || '<tr><td colspan="4">ChÆ°a cÃ³ thay Ä‘á»•i nÃ o.</td></tr>'}</table>`;
   on("#csv", () => {
@@ -3070,7 +3070,7 @@ CREATE OR REPLACE PACKAGE pkg_booking IS
     p_booking_id IN NUMBER, p_customer_id IN NUMBER
   );
 
-  PROCEDURE sp_release_expired_holds;
+  PROCEDURE thu hồi ghế hết hạn;
   PROCEDURE sp_daily_revenue_report(p_date IN DATE DEFAULT TRUNC(SYSDATE));
 
   FUNCTION fn_check_room_overlap(
@@ -3200,7 +3200,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_booking IS
       RAISE;
   END sp_confirm_booking;
 
-  PROCEDURE sp_release_expired_holds IS
+  PROCEDURE thu hồi ghế hết hạn IS
   BEGIN
     UPDATE showtime_seat
        SET status = 'AVAILABLE', held_by = NULL, hold_expires_at = NULL, booking_id = NULL
@@ -3208,7 +3208,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_booking IS
     UPDATE booking SET status = 'EXPIRED'
      WHERE status = 'PENDING' AND expires_at < SYSTIMESTAMP;
     COMMIT;
-  END sp_release_expired_holds;
+  END thu hồi ghế hết hạn;
 
   PROCEDURE sp_daily_revenue_report(p_date IN DATE DEFAULT TRUNC(SYSDATE)) IS
     CURSOR c_revenue IS
@@ -3677,7 +3677,7 @@ CREATE OR REPLACE PACKAGE pkg_booking IS
     p_booking_id IN NUMBER, p_customer_id IN NUMBER
   );
 
-  PROCEDURE sp_release_expired_holds;
+  PROCEDURE thu hồi ghế hết hạn;
   PROCEDURE sp_daily_revenue_report(p_date IN DATE DEFAULT TRUNC(SYSDATE));
 
   FUNCTION fn_check_room_overlap(
@@ -3810,7 +3810,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_booking IS
   END sp_confirm_booking;
 
   -- 3.6. Giáº£i phÃ³ng gháº¿ giá»¯ quÃ¡ háº¡n (Ä‘Æ°á»£c DBMS_SCHEDULER gá»i má»—i phÃºt)
-  PROCEDURE sp_release_expired_holds IS
+  PROCEDURE thu hồi ghế hết hạn IS
   BEGIN
     UPDATE showtime_seat
        SET status = 'AVAILABLE', held_by = NULL, hold_expires_at = NULL, booking_id = NULL
@@ -3818,7 +3818,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_booking IS
     UPDATE booking SET status = 'EXPIRED'
      WHERE status = 'PENDING' AND expires_at < SYSTIMESTAMP;
     COMMIT;
-  END sp_release_expired_holds;
+  END thu hồi ghế hết hạn;
 
   -- 3.7. BÃ¡o cÃ¡o doanh thu cuá»‘i ngÃ y â€” Con trá» tÆ°á»ng minh (Explicit Cursor)
   PROCEDURE sp_daily_revenue_report(p_date IN DATE DEFAULT TRUNC(SYSDATE)) IS
@@ -3953,7 +3953,7 @@ END pkg_booking;
 -- Trigger tá»± sinh gháº¿ trá»‘ng cho suáº¥t chiáº¿u má»›i (3.6), job dá»n gháº¿
 -- giá»¯ quÃ¡ háº¡n cháº¡y má»—i phÃºt (3.6), trigger ghi nháº­t kÃ½ Ä‘á»•i tráº¡ng thÃ¡i
 -- Ä‘Æ¡n (3.11.c). Cháº¡y SAU khi Ä‘Ã£ cÃ³ pkg_booking (file 03) vÃ¬ job gá»i
--- tháº³ng pkg_booking.sp_release_expired_holds.
+-- tháº³ng pkg_booking.thu hồi ghế hết hạn.
 -- ============================================================
 
 -- 3.6. Tá»± sinh gháº¿ trá»‘ng ngay khi thÃªm má»™t suáº¥t chiáº¿u má»›i
@@ -3976,7 +3976,7 @@ BEGIN
   DBMS_SCHEDULER.CREATE_JOB(
     job_name        => 'JOB_RELEASE_HOLDS',
     job_type        => 'PLSQL_BLOCK',
-    job_action      => 'BEGIN pkg_booking.sp_release_expired_holds; END;',
+    job_action      => 'BEGIN pkg_booking.thu hồi ghế hết hạn; END;',
     repeat_interval => 'FREQ=MINUTELY;INTERVAL=1',
     enabled         => TRUE);
 END;

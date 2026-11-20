@@ -333,7 +333,7 @@ function discount(code, sub, st) {
   if (p.max != null) d = Math.min(d, p.max);
   return Math.min(Math.round(d / 1000) * 1000, sub);
 }
-// sp_release_expired_holds (mục 3.6) – job chạy mỗi phút
+// thu hồi ghế hết hạn (mục 3.6) – job chạy mỗi phút
 function releaseExpired() {
   const n = Date.now();
   for (const k in db.ss) if (db.ss[k].status === 'HELD' && db.ss[k].exp < n) delete db.ss[k];
@@ -708,7 +708,7 @@ async function aRev(box) {
   const [rev, log] = await Promise.all([API.revenue(), API.audit()]), tot = rev.reduce((a, r) => a + Number(r.gross_revenue), 0), days = {};
   rev.forEach(r => (days[r.show_date] ||= []).push(r));
   const rows = Object.keys(days).sort().flatMap(d => days[d].sort((a, b) => b.gross_revenue - a.gross_revenue).map((r, i) => ({ ...r, rnk: i + 1 })));
-  box.innerHTML = `<div class="stats"><div><b>${money(tot)}</b><span>Doanh thu gộp</span></div><div><b>${rev.reduce((a, r) => a + Number(r.tickets_sold), 0)}</b><span>Vé đã bán</span></div><div><b>${log.filter(l => l.new_value === 'PAID').length}</b><span>Đơn đã thanh toán</span></div><div><b>${log.filter(l => ['CANCELLED', 'EXPIRED'].includes(l.new_value)).length}</b><span>Đơn huỷ hoặc hết hạn</span></div></div><p><button class="btn alt" id="csv">Xuất CSV</button> <button class="btn" id="rel">Chạy sp_release_expired_holds</button> <button class="btn alt" id="rst">Đặt lại dữ liệu</button></p>
+  box.innerHTML = `<div class="stats"><div><b>${money(tot)}</b><span>Doanh thu gộp</span></div><div><b>${rev.reduce((a, r) => a + Number(r.tickets_sold), 0)}</b><span>Vé đã bán</span></div><div><b>${log.filter(l => l.new_value === 'PAID').length}</b><span>Đơn đã thanh toán</span></div><div><b>${log.filter(l => ['CANCELLED', 'EXPIRED'].includes(l.new_value)).length}</b><span>Đơn huỷ hoặc hết hạn</span></div></div><p><button class="btn alt" id="csv">Xuất CSV</button> <button class="btn" id="rel">Chạy thu hồi ghế hết hạn</button> <button class="btn alt" id="rst">Đặt lại dữ liệu</button></p>
   <h3>Doanh thu và hạng phim theo ngày chiếu</h3><table><tr><th>Ngày chiếu</th><th>Hạng</th><th>Phim</th><th>Số vé</th><th>Doanh thu gộp</th></tr>${rows.map(r => `<tr><td>${new Date(+r.show_date || r.show_date).toLocaleDateString('vi-VN')}</td><td>${r.rnk}</td><td>${r.title}</td><td>${r.tickets_sold}</td><td>${money(r.gross_revenue)}</td></tr>`).join('') || '<tr><td colspan="5">Chưa có vé nào được bán.</td></tr>'}<tr><td colspan="4"><b>Tổng cộng</b></td><td><b>${money(tot)}</b></td></tr></table>
   <h3>Nhật ký đổi trạng thái đơn</h3><table><tr><th>Đơn</th><th>Từ</th><th>Sang</th><th>Lúc</th></tr>${log.map(l => `<tr><td>#${l.record_id}</td><td>${l.old_value}</td><td>${l.new_value}</td><td>${fDate(l.changed_at)} ${fTime(l.changed_at)}</td></tr>`).join('') || '<tr><td colspan="4">Chưa có thay đổi nào.</td></tr>'}</table>`;
   on('#csv', () => { const csv = '\ufeffNgày chiếu,Hạng,Phim,Số vé,Doanh thu gộp\n' + rows.map(r => [new Date(+r.show_date || r.show_date).toLocaleDateString('vi-VN'), r.rnk, '"' + r.title + '"', r.tickets_sold, r.gross_revenue].join(',')).join('\n'); const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); a.download = 'doanh-thu.csv'; a.click(); });

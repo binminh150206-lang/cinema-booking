@@ -198,7 +198,6 @@ END;
   ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'showtimes/:id/cancel', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
 
   ORDS.DEFINE_TEMPLATE(p_module_name => 'cinema_api', p_pattern => 'addshowtime');
-  BEGIN
   ORDS.DEFINE_HANDLER(
     p_module_name => 'cinema_api',
     p_pattern     => 'addshowtime',
@@ -220,10 +219,7 @@ END;
             AT TIME ZONE '+07:00' AS TIMESTAMP
           );
         ELSIF INSTR(v_raw, 'Z') > 0 THEN
-          v_start := CAST(
-            TO_TIMESTAMP_TZ(v_raw, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')
-            AT TIME ZONE '+07:00' AS TIMESTAMP
-          );
+          v_start := TO_TIMESTAMP(SUBSTR(v_raw, 1, 19), 'YYYY-MM-DD"T"HH24:MI:SS') + INTERVAL '7' HOUR;
         ELSE
           v_start := TO_TIMESTAMP(REPLACE(SUBSTR(v_raw, 1, 16), 'T', ' '), 'YYYY-MM-DD HH24:MI');
         END IF;
@@ -239,8 +235,6 @@ END;
       END;
     ]'
   );
-  COMMIT;
-END;
   ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'addshowtime', p_method => 'POST', p_name => 'showtime_id', p_bind_variable_name => 'showtime_id', p_source_type => 'RESPONSE', p_param_type => 'INT', p_access_method => 'OUT');
   ORDS.DEFINE_PARAMETER(p_module_name => 'cinema_api', p_pattern => 'addshowtime', p_method => 'POST', p_name => 'error', p_bind_variable_name => 'error', p_source_type => 'RESPONSE', p_param_type => 'STRING', p_access_method => 'OUT');
 
@@ -613,6 +607,114 @@ END;
   ORDS.SET_MODULE_ORIGINS_ALLOWED(
     p_module_name     => 'cinema_api',
     p_origins_allowed => 'http://127.0.0.1:5500,http://localhost:5500'
+  );
+
+  COMMIT;
+END;
+
+BEGIN
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api',
+    p_pattern     => 'addshowtime',
+    p_method      => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'~
+      DECLARE
+        v_raw   VARCHAR2(100) := TRIM(:p_start);
+        v_ymd   VARCHAR2(10)  := REGEXP_SUBSTR(v_raw, '[0-9]{4}-[0-9]{2}-[0-9]{2}');
+        v_hm    VARCHAR2(5)   := REGEXP_SUBSTR(v_raw, '[0-9]{2}:[0-9]{2}');
+        v_start TIMESTAMP;
+        v_dur   NUMBER;
+        v_end   TIMESTAMP;
+        v_cnt   NUMBER;
+      BEGIN
+        v_start := TO_TIMESTAMP(v_ymd || ' ' || v_hm, 'YYYY-MM-DD HH24:MI');
+        IF v_raw LIKE '%Z' THEN
+          v_start := CAST(FROM_TZ(v_start, 'UTC') AT TIME ZONE '+07:00' AS TIMESTAMP);
+        END IF;
+
+        SELECT duration_min INTO v_dur FROM movie WHERE movie_id = TO_NUMBER(:p_movie_id);
+        v_end := v_start + NUMTODSINTERVAL(v_dur + 15, 'MINUTE');
+
+        SELECT COUNT(*) INTO v_cnt
+          FROM showtime
+         WHERE room_id = TO_NUMBER(:p_room_id) AND status <> 'CANCELLED'
+           AND start_time < v_end AND end_time > v_start;
+        IF v_cnt > 0 THEN
+          RAISE_APPLICATION_ERROR(-20050, 'Phòng đã có suất chiếu trùng giờ');
+        END IF;
+
+        INSERT INTO showtime(movie_id, room_id, start_time, end_time, base_price, status)
+        VALUES (TO_NUMBER(:p_movie_id), TO_NUMBER(:p_room_id), v_start, v_end, TO_NUMBER(:p_base_price), 'OPEN');
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN
+          ROLLBACK;
+          :status_code := 400;
+          :error := SQLERRM || ' [p_start=' || :p_start || ']';
+      END;
+    ~'
+  );
+
+  ORDS.DEFINE_PARAMETER(
+    p_module_name        => 'cinema_api',
+    p_pattern            => 'addshowtime',
+    p_method             => 'POST',
+    p_name               => 'error',
+    p_bind_variable_name => 'error',
+    p_source_type        => 'RESPONSE',
+    p_param_type         => 'STRING',
+    p_access_method      => 'OUT'
+  );
+
+  COMMIT;
+END;
+
+BEGIN
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'cinema_api',
+    p_pattern     => 'addshowtime',
+    p_method      => 'POST',
+    p_source_type => 'plsql/block',
+    p_source      => q'~
+      DECLARE
+        v_start TIMESTAMP := CAST(FROM_TZ(:p_start, 'UTC') AT TIME ZONE '+07:00' AS TIMESTAMP);
+        v_dur   NUMBER;
+        v_end   TIMESTAMP;
+        v_cnt   NUMBER;
+      BEGIN
+        SELECT duration_min INTO v_dur FROM movie WHERE movie_id = TO_NUMBER(:p_movie_id);
+        v_end := v_start + NUMTODSINTERVAL(v_dur + 15, 'MINUTE');
+
+        SELECT COUNT(*) INTO v_cnt
+          FROM showtime
+         WHERE room_id = TO_NUMBER(:p_room_id) AND status <> 'CANCELLED'
+           AND start_time < v_end AND end_time > v_start;
+        IF v_cnt > 0 THEN
+          RAISE_APPLICATION_ERROR(-20050, 'Phòng đã có suất chiếu trùng giờ');
+        END IF;
+
+        INSERT INTO showtime(movie_id, room_id, start_time, end_time, base_price, status)
+        VALUES (TO_NUMBER(:p_movie_id), TO_NUMBER(:p_room_id), v_start, v_end, TO_NUMBER(:p_base_price), 'OPEN');
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN
+          ROLLBACK;
+          :status_code := 400;
+          :error := SQLERRM;
+      END;
+    ~'
+  );
+
+  ORDS.DEFINE_PARAMETER(
+    p_module_name        => 'cinema_api',
+    p_pattern            => 'addshowtime',
+    p_method             => 'POST',
+    p_name               => 'error',
+    p_bind_variable_name => 'error',
+    p_source_type        => 'RESPONSE',
+    p_param_type         => 'STRING',
+    p_access_method      => 'OUT'
   );
 
   COMMIT;
